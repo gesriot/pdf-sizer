@@ -4,14 +4,14 @@ A command-line tool that converts a folder of images into PDF files, automatical
 
 ## The Problem
 
-When embedding images into a PDF, the resulting file size is often unpredictable. JPEG or PNG files that sum to your desired size may produce a much larger PDF when packaged together — because most PDF libraries decode images and re-store them as raw pixels. This tool solves that by embedding JPEG data directly into the PDF stream (DCTDecode filter), making the file size predictable and controllable.
+When embedding images into a PDF, the resulting file size is often unpredictable. JPEG or PNG files that sum to your desired size may produce a much larger PDF when packaged together – because most PDF libraries decode images and re-store them as raw pixels. This tool solves that by embedding JPEG data directly into the PDF stream (DCTDecode filter), making the file size predictable and controllable.
 
 ## How It Works
 
-Instead of producing a single PDF, the tool generates **multiple variants** — each with the same target file size but a different quality/scale tradeoff:
+Instead of producing a single PDF, the tool generates **multiple variants** – each with the same target file size but a different quality/scale tradeoff:
 
-- **High quality, low scale** — fewer compression artifacts, sharper edges and text, but lower resolution
-- **Low quality, high scale** — more compression artifacts, but higher resolution with more fine detail
+- **High quality, low scale** – fewer compression artifacts, sharper edges and text, but lower resolution
+- **Low quality, high scale** – more compression artifacts, but higher resolution with more fine detail
 
 For each JPEG quality level (100, 95, 90, ... down to 5), the tool runs a **binary search** over the scale factor to find the exact scale that produces a PDF within ±2 MB of your target. Only successful variants are saved to disk.
 
@@ -27,7 +27,7 @@ You open all variants and pick whichever looks best for your specific images.
 ## Technical Details
 
 - Images are resized using the **Lanczos3** filter (high-quality downscaling)
-- JPEG bytes are embedded in the PDF with the **DCTDecode** filter — the original compressed data is stored as-is, not re-encoded
+- JPEG bytes are embedded in the PDF with the **DCTDecode** filter – the original compressed data is stored as-is, not re-encoded
 - PDF size ≈ sum of JPEG sizes + ~300 bytes overhead per page
 - Built with [`pdf-writer`](https://crates.io/crates/pdf-writer) and [`image`](https://crates.io/crates/image)
 
@@ -76,7 +76,7 @@ The binary will be at `target/release/pdf-sizer` (or `pdf-sizer.exe` on Windows)
      quality= 90, scale= 73% -> variant_q090_s073.pdf (19.5 MB)
      quality= 85, scale= 77% -> variant_q085_s077.pdf (20.1 MB)
      quality= 80, scale= 82% -> variant_q080_s082.pdf (19.9 MB)
-     quality= 65: even at scale=100% size is 18.1 MB — below target, stopping
+     quality= 65: even at scale=100% size is 18.1 MB – below target, stopping
 
    --- Summary ---
    Variants created: 5
