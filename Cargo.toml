@@ -7,3 +7,5 @@ edition = "2024"
 pdf-writer = "0.12"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "bmp", "tiff", "webp"] }
 mozjpeg = "0.10"
+imageproc = "0.26"
+openjp2 = "0.6"
