@@ -2,7 +2,7 @@
 
 Pack a folder of scanned images into compact PDFs that hit a target file size.
 The tool generates multiple variants, each at the same size but with a different
-quality/scale trade-off — you pick the one that looks best.
+quality/scale trade-off – you pick the one that looks best.
 
 Supports JPEG, JPEG 2000, and MRC (Mixed Raster Content) compression, plus
 optional scan preprocessing (despeckle, background flattening, deskew).
@@ -19,7 +19,7 @@ pdf-sizer
 pdf-sizer run --input ./scans --target-mb 20
 
 # Legacy shorthand (deprecated)
-pdf-sizer 20          # reads ./images/ next to the binary
+pdf-sizer 20          # reads images/ next to the binary
 ```
 
 ---
@@ -37,9 +37,11 @@ JPEG q=98   scale=89%  →  variant_q098_s089.pdf   (20.0 MB)
 JPEG q=97   scale=95%  →  variant_q097_s095.pdf   (19.8 MB)  ← most detail
 ```
 
-Results are sorted by file size (largest first) so the highest-quality
-variants appear at the top. A **Recommended** section highlights four
-picks automatically: best for text, balanced, maximum detail, smallest.
+In the GUI, results are sorted by file size (largest first) so the
+highest-quality variants appear at the top. A **Recommended** section
+highlights four picks automatically: best for text, balanced, maximum
+detail, smallest. The CLI prints variants in generation order without
+recommendations.
 
 ---
 
@@ -47,10 +49,10 @@ picks automatically: best for text, balanced, maximum detail, smallest.
 
 | Mode | Filter in PDF | Best for |
 |---|---|---|
-| `jpeg` (default) | `DCTDecode` | General purpose; fastest |
+| `jpeg` (CLI default) | `DCTDecode` | General purpose; fastest |
 | `jp2` | `JPXDecode` | Better at low bitrates; softer artefacts |
 | `mrc` | `CCITTFaxDecode`/`JBIG2Decode` + `DCTDecode` | Scanned text: 1-bit mask for text, compressed JPEG background |
-| `auto` | all three | Generates JPEG + JP2 + MRC variants in one run |
+| `auto` (GUI default) | all three | Generates JPEG + JP2 + MRC variants in one run |
 
 MRC stores text as a lossless 1-bit mask (JBIG2 or CCITT G4, whichever is
 smaller) over a heavily compressed background — similar to what ABBYY
@@ -122,7 +124,7 @@ Binary: `target/release/pdf-sizer`
 
 `jpg`, `jpeg`, `png`, `bmp`, `tiff`, `tif`, `webp`
 
-Images are sorted alphabetically — that order becomes the page order in the PDF.
+Images are sorted alphabetically – that order becomes the page order in the PDF.
 
 ---
 
