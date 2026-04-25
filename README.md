@@ -55,7 +55,7 @@ recommendations.
 | `auto` (GUI default) | all three | Generates JPEG + JP2 + MRC variants in one run |
 
 MRC stores text as a lossless 1-bit mask (JBIG2 or CCITT G4, whichever is
-smaller) over a heavily compressed background — similar to what ABBYY
+smaller) over a heavily compressed background – similar to what ABBYY
 FineReader uses internally.
 
 ---
@@ -66,7 +66,7 @@ Optional scan cleanup applied before compression (does not affect source files):
 
 | Flag | Effect |
 |---|---|
-| `--despeckle` | 3×3 median filter — removes scanner noise |
+| `--despeckle` | 3×3 median filter – removes scanner noise |
 | `--flatten[=N]` | Background flattening — evens out paper colour/texture; N = aggressiveness 0–255, default 30 |
 | `--deskew` | Auto-detects and corrects page tilt (±10°) |
 
