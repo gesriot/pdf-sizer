@@ -1,7 +1,9 @@
+use fax::{Color as FaxColor, VecWriter};
 use image::GenericImageView;
-use imageproc::contrast::{ThresholdType, otsu_level, threshold};
+use imageproc::contrast::{ThresholdType, adaptive_threshold, otsu_level, threshold};
 use imageproc::filter::median_filter;
 use imageproc::geometric_transformations::{Interpolation, rotate_about_center_no_crop};
+use imageproc::region_labelling::{Connectivity, connected_components};
 use mozjpeg::{ColorSpace as MozCs, Compress};
 use openjp2::{
     OPJ_CLRSPC_GRAY, OPJ_CLRSPC_SRGB, OPJ_CODEC_JP2,
@@ -13,6 +15,7 @@ use openjp2::{
     opj_cparameters_t, opj_image, opj_image_comptparm,
 };
 use pdf_writer::{Content, Finish, Name, Pdf, Rect, Ref};
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::c_void;
 use std::fs;
@@ -33,10 +36,34 @@ enum PdfFilter {
     Jpx, // JPEG2000 (JPXDecode)
 }
 
+struct TextMask {
+    width: u32,
+    height: u32,
+    pixels: Vec<bool>,
+    coverage: f32,
+    /// Share of structural (line-like) components among all non-trivial ones.
+    /// High values flag tables/diagrams that MRC would misrepresent as a 1-bit mask.
+    line_ratio: f32,
+}
+
+struct MrcSource {
+    background: image::DynamicImage,
+    mask: TextMask,
+    mask_g4: Vec<u8>,
+}
+
+struct MrcFrame {
+    background: Frame,
+    mask_g4: Vec<u8>,
+    mask_w: u32,
+    mask_h: u32,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum CodecChoice {
     Jpeg,
     Jp2,
+    Mrc,
     Auto,
 }
 
@@ -52,7 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if args.len() < 2 {
         eprintln!(
-            "Использование: {} <МБ> [--despeckle] [--flatten[=<0-255>]] [--deskew] [--codec=jpeg|jp2|auto]",
+            "Использование: {} <МБ> [--despeckle] [--flatten[=<0-255>]] [--deskew] [--codec=jpeg|jp2|mrc|auto]",
             args[0]
         );
         eprintln!("Изображения берутся из папки images/ рядом с исполняемым файлом");
@@ -78,13 +105,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             opts.flatten_threshold = val
                 .parse::<u8>()
                 .map_err(|_| format!("--flatten: '{}' не является числом от 0 до 255", val))?;
-        } else if let Some(val) = arg.strip_prefix("--codec=") {
+        } else if let Some(val) = arg
+            .strip_prefix("--codec=")
+            .or_else(|| arg.strip_prefix("--mode="))
+        {
             codec_choice = match val {
                 "jpeg" => CodecChoice::Jpeg,
                 "jp2" => CodecChoice::Jp2,
+                "mrc" => CodecChoice::Mrc,
                 "auto" => CodecChoice::Auto,
                 _ => {
-                    return Err(format!("--codec: '{}' — ожидается jpeg, jp2 или auto", val).into());
+                    return Err(
+                        format!("--codec: '{}' — ожидается jpeg, jp2, mrc или auto", val).into(),
+                    );
                 }
             };
         } else if target_mb_arg.is_none() {
@@ -157,12 +190,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let allow_passthrough = !opts.despeckle && opts.flatten_threshold == 0 && !opts.deskew;
 
     // ------------------------------------------------------------------ JPEG
-    let run_jpeg = codec_choice != CodecChoice::Jp2;
-    let run_jp2 = codec_choice != CodecChoice::Jpeg;
+    let run_jpeg = matches!(codec_choice, CodecChoice::Jpeg | CodecChoice::Auto);
+    let run_jp2 = matches!(codec_choice, CodecChoice::Jp2 | CodecChoice::Auto);
+    let run_mrc = matches!(codec_choice, CodecChoice::Mrc | CodecChoice::Auto);
 
     let quality_steps: Vec<u8> = (1..=20).rev().map(|i| i * 5).collect(); // 100, 95, ..., 5
     // (filename, setting_label, scale%, size_mb)
-    // setting_label: "q=080" for JPEG, "bpp=0.50" for JP2
+    // setting_label: "q=080" for JPEG, "bpp=0.50" for JP2, "mrc-q=040" for MRC.
     let mut variants: Vec<(String, String, u32, f64)> = Vec::new();
 
     if run_jpeg {
@@ -350,6 +384,96 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // ------------------------------------------------------------------ MRC-lite
+    let mrc_quality_steps: &[u8] = &[55, 45, 35, 25];
+
+    if run_mrc {
+        println!(
+            "\n[MRC] Поиск вариантов: маска текста CCITT G4 + JPEG-фон около {:.0} MB...\n",
+            target_mb
+        );
+
+        let mrc_sources = prepare_mrc_sources(&images)?;
+        if let Some(mrc_sources) = mrc_sources {
+            for &q in mrc_quality_steps {
+                let max_size = estimate_mrc_size(&mrc_sources, q, 1.0)?;
+                if max_size < target_bytes.saturating_sub(tolerance_bytes) {
+                    println!(
+                        "  bg-q={:3}: даже при bg-scale=100% размер {:.1} MB — меньше цели, пропуск остальных",
+                        q,
+                        max_size as f64 / (1024.0 * 1024.0)
+                    );
+                    break;
+                }
+
+                let min_size = estimate_mrc_size(&mrc_sources, q, 0.05)?;
+                if min_size > target_bytes + tolerance_bytes {
+                    println!(
+                        "  bg-q={:3}: даже при bg-scale=5% размер {:.1} MB — больше цели, пропуск",
+                        q,
+                        min_size as f64 / (1024.0 * 1024.0)
+                    );
+                    continue;
+                }
+
+                let mut lo = 5.0_f64;
+                let mut hi = 100.0_f64;
+                let mut best: Option<(u32, Vec<u8>, f64)> = None;
+
+                for _ in 0..20 {
+                    if hi - lo < 0.5 {
+                        break;
+                    }
+                    let mid = ((lo + hi) / 2.0).round().clamp(5.0, 100.0);
+                    let s = mid / 100.0;
+
+                    let frames = encode_mrc_frames(&mrc_sources, q, s)?;
+                    let pdf_bytes = build_mrc_pdf(&frames);
+                    let size = pdf_bytes.len() as u64;
+
+                    let in_range = size <= target_bytes + tolerance_bytes
+                        && size >= target_bytes.saturating_sub(tolerance_bytes);
+
+                    if in_range {
+                        best = Some((mid as u32, pdf_bytes, size as f64 / (1024.0 * 1024.0)));
+                        break;
+                    } else if size > target_bytes {
+                        hi = mid - 1.0;
+                    } else {
+                        lo = mid + 1.0;
+                    }
+                }
+
+                if best.is_none() {
+                    let mid = ((lo + hi) / 2.0).round().clamp(5.0, 100.0);
+                    let s = mid / 100.0;
+                    let frames = encode_mrc_frames(&mrc_sources, q, s)?;
+                    let pdf_bytes = build_mrc_pdf(&frames);
+                    let size = pdf_bytes.len() as u64;
+                    if size <= target_bytes + tolerance_bytes
+                        && size >= target_bytes.saturating_sub(tolerance_bytes)
+                    {
+                        best = Some((mid as u32, pdf_bytes, size as f64 / (1024.0 * 1024.0)));
+                    }
+                }
+
+                if let Some((s_pct, pdf_bytes, size_mb)) = best {
+                    let filename = format!("variant_mrc_q{:03}_s{:03}.pdf", q, s_pct);
+                    fs::write(&filename, &pdf_bytes)?;
+                    println!(
+                        "  bg-q={:3}, bg-scale={:3}% -> {} ({:.1} MB)",
+                        q, s_pct, filename, size_mb
+                    );
+                    variants.push((filename, format!("mrc-q={:03}", q), s_pct, size_mb));
+                } else {
+                    println!("  bg-q={:3}: не удалось попасть в целевой диапазон", q);
+                }
+            }
+        } else {
+            println!("  MRC пропущен: маска текста слишком мала/велика хотя бы на одной странице");
+        }
+    }
+
     println!("\n--- Итого ---");
     if variants.is_empty() {
         println!("Не удалось создать ни одного варианта в целевом диапазоне.");
@@ -361,7 +485,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         println!("  {}", "-".repeat(56));
         for (filename, setting, s, size_mb) in &variants {
-            let hint = if let Some(q_str) = setting.strip_prefix("q=") {
+            let hint = if let Some(q_str) = setting
+                .strip_prefix("q=")
+                .or_else(|| setting.strip_prefix("mrc-q="))
+            {
                 let q: u8 = q_str.parse().unwrap_or(0);
                 if q > 80 {
                     "  <- чёткость"
@@ -381,6 +508,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         println!("\n  JPEG q=...   : высокий q  = меньше артефактов (текст, чёткие края)");
         println!("  JP2 bpp=...  : меньший bpp = агрессивнее сжатие, мягче артефакты");
+        println!("  MRC mrc-q=...: q управляет только JPEG-фоном; текст идёт 1-битной G4-маской");
         println!("  Высокий scale = больше деталей и разрешение (мелкие элементы)");
     }
 
@@ -560,6 +688,257 @@ fn apply_deskew(img: image::DynamicImage) -> image::DynamicImage {
 }
 
 // ---------------------------------------------------------------------------
+// MRC-lite segmentation and CCITT G4 mask encoding
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+struct ComponentStats {
+    min_x: u32,
+    min_y: u32,
+    max_x: u32,
+    max_y: u32,
+    area: u32,
+}
+
+impl ComponentStats {
+    fn new(x: u32, y: u32) -> Self {
+        Self {
+            min_x: x,
+            min_y: y,
+            max_x: x,
+            max_y: y,
+            area: 0,
+        }
+    }
+
+    fn add(&mut self, x: u32, y: u32) {
+        self.min_x = self.min_x.min(x);
+        self.min_y = self.min_y.min(y);
+        self.max_x = self.max_x.max(x);
+        self.max_y = self.max_y.max(y);
+        self.area += 1;
+    }
+
+    fn width(self) -> u32 {
+        self.max_x - self.min_x + 1
+    }
+
+    fn height(self) -> u32 {
+        self.max_y - self.min_y + 1
+    }
+}
+
+fn adaptive_mrc_block_radius(w: u32, h: u32) -> u32 {
+    (w.min(h) / 40).clamp(3, 35)
+}
+
+fn is_text_component(stats: ComponentStats, page_w: u32, page_h: u32) -> bool {
+    let cw = stats.width();
+    let ch = stats.height();
+    if stats.area < 2 {
+        return false;
+    }
+
+    let min_h = if page_h < 80 { 1 } else { 2 };
+    let max_h = (page_h / 3).clamp(8, 160);
+    let max_w = (page_w / 2).clamp(8, 240);
+    let aspect = cw as f32 / ch.max(1) as f32;
+    let fill = stats.area as f32 / (cw * ch).max(1) as f32;
+
+    ch >= min_h && ch <= max_h && cw <= max_w && (0.05..=20.0).contains(&aspect) && fill >= 0.01
+}
+
+/// Table rules, frames, dividers: components that are thin (≤ 3 px) in one axis and
+/// span a meaningful fraction of the page in the other. MRC would bake these into the
+/// text mask as solid black; we drop them here and let the background layer render them.
+fn is_line_like(stats: ComponentStats, page_w: u32, page_h: u32) -> bool {
+    let cw = stats.width();
+    let ch = stats.height();
+    let long_h = page_w as f32 * 0.15;
+    let long_v = page_h as f32 * 0.15;
+    (ch <= 3 && cw as f32 > long_h) || (cw <= 3 && ch as f32 > long_v)
+}
+
+fn segment_text_mask(img: &image::DynamicImage) -> TextMask {
+    let gray = img.to_luma8();
+    let (w, h) = gray.dimensions();
+    let radius = adaptive_mrc_block_radius(w, h);
+    let binary = adaptive_threshold(&gray, radius, 15);
+    let labels = connected_components(&binary, Connectivity::Eight, image::Luma([255u8]));
+
+    let mut stats_by_label: HashMap<u32, ComponentStats> = HashMap::new();
+    for (x, y, p) in labels.enumerate_pixels() {
+        let label = p[0];
+        if label == 0 {
+            continue;
+        }
+        stats_by_label
+            .entry(label)
+            .or_insert_with(|| ComponentStats::new(x, y))
+            .add(x, y);
+    }
+
+    // Pass 1: split components into line-like (table rules, frames) and text candidates.
+    let mut candidates: Vec<(u32, ComponentStats)> = Vec::new();
+    let mut line_like = 0usize;
+    for (label, stats) in stats_by_label {
+        if is_line_like(stats, w, h) {
+            line_like += 1;
+        } else if is_text_component(stats, w, h) {
+            candidates.push((label, stats));
+        }
+    }
+
+    // line_ratio is evaluated against the first-pass candidate count so that the later
+    // median filter — which prunes size outliers — does not inflate the ratio.
+    let line_ratio = if line_like + candidates.len() == 0 {
+        0.0
+    } else {
+        line_like as f32 / (line_like + candidates.len()) as f32
+    };
+
+    // Pass 2: keep only glyph-sized components around the median candidate height.
+    // Drops stray oversized/undersized components (banners, dust, page numbers in a
+    // different size) that would otherwise be forced into the mask.
+    if candidates.len() >= 4 {
+        let mut heights: Vec<u32> = candidates.iter().map(|(_, s)| s.height()).collect();
+        heights.sort_unstable();
+        let median_h = heights[heights.len() / 2] as f32;
+        let lo = (median_h * 0.35).floor().max(1.0) as u32;
+        let hi = (median_h * 3.0).ceil() as u32;
+        candidates.retain(|(_, s)| {
+            let ch = s.height();
+            ch >= lo && ch <= hi
+        });
+    }
+
+    let keep: HashSet<u32> = candidates.iter().map(|(l, _)| *l).collect();
+
+    let mut pixels = vec![false; (w * h) as usize];
+    let mut text_pixels = 0usize;
+    for (x, y, p) in labels.enumerate_pixels() {
+        if keep.contains(&p[0]) {
+            let idx = (y * w + x) as usize;
+            pixels[idx] = true;
+            text_pixels += 1;
+        }
+    }
+
+    let coverage = if w == 0 || h == 0 {
+        0.0
+    } else {
+        text_pixels as f32 / (w as f32 * h as f32)
+    };
+
+    TextMask {
+        width: w,
+        height: h,
+        pixels,
+        coverage,
+        line_ratio,
+    }
+}
+
+fn is_mrc_suitable(mask: &TextMask) -> bool {
+    // Coverage gate rejects near-empty pages and pages where segmentation blew up.
+    // line_ratio gate rejects pages dominated by table rules / diagram lines — those
+    // should stay in the background JPEG rather than becoming a 1-bit mask.
+    (0.005..=0.70).contains(&mask.coverage) && mask.line_ratio <= 0.30
+}
+
+fn fill_masked_background(img: &image::DynamicImage, mask: &TextMask) -> image::DynamicImage {
+    let rgb = img.to_rgb8();
+    let bg = estimate_background(&rgb);
+    let out = image::RgbImage::from_fn(rgb.width(), rgb.height(), |x, y| {
+        let idx = (y * mask.width + x) as usize;
+        if mask.pixels.get(idx).copied().unwrap_or(false) {
+            image::Rgb(bg)
+        } else {
+            *rgb.get_pixel(x, y)
+        }
+    });
+    image::DynamicImage::ImageRgb8(out)
+}
+
+fn encode_text_mask_g4(mask: &TextMask) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    if mask.width > u16::MAX as u32 || mask.height > u16::MAX as u32 {
+        return Err("MRC: CCITT G4 encoder supports dimensions up to 65535".into());
+    }
+
+    let width = mask.width as u16;
+    let mut encoder = fax::encoder::Encoder::new(VecWriter::with_capacity(
+        (mask.width * mask.height) as usize,
+    ));
+
+    for y in 0..mask.height {
+        let row = (0..mask.width).map(|x| {
+            let idx = (y * mask.width + x) as usize;
+            if mask.pixels[idx] {
+                FaxColor::Black
+            } else {
+                FaxColor::White
+            }
+        });
+        encoder.encode_line(row, width)?;
+    }
+
+    Ok(encoder.finish()?.finish())
+}
+
+fn prepare_mrc_sources(
+    images: &[(PathBuf, image::DynamicImage)],
+) -> Result<Option<Vec<MrcSource>>, Box<dyn std::error::Error>> {
+    let mut sources = Vec::with_capacity(images.len());
+    for (path, img) in images {
+        let mask = segment_text_mask(img);
+        if !is_mrc_suitable(&mask) {
+            println!(
+                "  MRC: {} пропущен по покрытию маски {:.2}%",
+                path.display(),
+                mask.coverage * 100.0
+            );
+            return Ok(None);
+        }
+        let background = fill_masked_background(img, &mask);
+        let mask_g4 = encode_text_mask_g4(&mask)?;
+        sources.push(MrcSource {
+            background,
+            mask,
+            mask_g4,
+        });
+    }
+    Ok(Some(sources))
+}
+
+fn encode_mrc_frames(
+    sources: &[MrcSource],
+    bg_quality: u8,
+    bg_scale: f64,
+) -> Result<Vec<MrcFrame>, Box<dyn std::error::Error>> {
+    sources
+        .iter()
+        .map(|source| {
+            let background = encode_raster_as_jpeg(&source.background, bg_quality, bg_scale)?;
+            Ok(MrcFrame {
+                background,
+                mask_g4: source.mask_g4.clone(),
+                mask_w: source.mask.width,
+                mask_h: source.mask.height,
+            })
+        })
+        .collect()
+}
+
+fn estimate_mrc_size(
+    sources: &[MrcSource],
+    bg_quality: u8,
+    bg_scale: f64,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let frames = encode_mrc_frames(sources, bg_quality, bg_scale)?;
+    Ok(build_mrc_pdf(&frames).len() as u64)
+}
+
+// ---------------------------------------------------------------------------
 
 fn estimate_pdf_size(
     images: &[(PathBuf, image::DynamicImage)],
@@ -671,6 +1050,37 @@ fn encode_mozjpeg(
     Ok(comp.finish()?)
 }
 
+fn encode_raster_as_jpeg(
+    img: &image::DynamicImage,
+    quality: u8,
+    scale: f64,
+) -> Result<Frame, Box<dyn std::error::Error>> {
+    let (orig_w, orig_h) = img.dimensions();
+    let new_w = ((orig_w as f64) * scale).round() as u32;
+    let new_h = ((orig_h as f64) * scale).round() as u32;
+    // Clamp to 1×1 so neither codec receives a zero-dimension image when scale is tiny.
+    let new_w = new_w.max(1);
+    let new_h = new_h.max(1);
+
+    let resized = if scale < 1.0 {
+        img.resize_exact(new_w, new_h, image::imageops::FilterType::Lanczos3)
+    } else {
+        img.clone()
+    };
+
+    if is_effectively_grayscale(&resized) {
+        let gray = resized.to_luma8();
+        let (w, h) = gray.dimensions();
+        let bytes = encode_mozjpeg(gray.as_raw(), w, h, quality, true)?;
+        Ok((bytes, w, h, Cs::Gray, PdfFilter::Dct))
+    } else {
+        let rgb = resized.to_rgb8();
+        let (w, h) = rgb.dimensions();
+        let bytes = encode_mozjpeg(rgb.as_raw(), w, h, quality, false)?;
+        Ok((bytes, w, h, Cs::Rgb, PdfFilter::Dct))
+    }
+}
+
 fn encode_image(
     path: &Path,
     img: &image::DynamicImage,
@@ -703,30 +1113,7 @@ fn encode_image(
         }
     }
 
-    let (orig_w, orig_h) = img.dimensions();
-    let new_w = ((orig_w as f64) * scale).round() as u32;
-    let new_h = ((orig_h as f64) * scale).round() as u32;
-    // Clamp to 1×1 so neither codec receives a zero-dimension image when scale is tiny.
-    let new_w = new_w.max(1);
-    let new_h = new_h.max(1);
-
-    let resized = if scale < 1.0 {
-        img.resize_exact(new_w, new_h, image::imageops::FilterType::Lanczos3)
-    } else {
-        img.clone()
-    };
-
-    if is_effectively_grayscale(&resized) {
-        let gray = resized.to_luma8();
-        let (w, h) = gray.dimensions();
-        let bytes = encode_mozjpeg(gray.as_raw(), w, h, quality, true)?;
-        Ok((bytes, w, h, Cs::Gray, PdfFilter::Dct))
-    } else {
-        let rgb = resized.to_rgb8();
-        let (w, h) = rgb.dimensions();
-        let bytes = encode_mozjpeg(rgb.as_raw(), w, h, quality, false)?;
-        Ok((bytes, w, h, Cs::Rgb, PdfFilter::Dct))
-    }
+    encode_raster_as_jpeg(img, quality, scale)
 }
 
 // ---------------------------------------------------------------------------
@@ -995,6 +1382,101 @@ fn build_pdf(images: &[Frame]) -> Vec<u8> {
     pdf.finish()
 }
 
+fn build_mrc_pdf(frames: &[MrcFrame]) -> Vec<u8> {
+    let mut pdf = Pdf::new();
+
+    let catalog_id = Ref::new(1);
+    let page_tree_id = Ref::new(2);
+    let base_ref = 3;
+
+    let mut page_ids = Vec::new();
+
+    for (i, frame) in frames.iter().enumerate() {
+        let page_id = Ref::new((base_ref + i * 4) as i32);
+        let content_id = Ref::new((base_ref + i * 4 + 1) as i32);
+        let bg_id = Ref::new((base_ref + i * 4 + 2) as i32);
+        let mask_id = Ref::new((base_ref + i * 4 + 3) as i32);
+
+        page_ids.push(page_id);
+
+        let page_width_pt = frame.mask_w as f32 * 72.0 / 150.0;
+        let page_height_pt = frame.mask_h as f32 * 72.0 / 150.0;
+
+        let (bg_data, bg_w, bg_h, bg_cs, bg_filter) = &frame.background;
+        let mut bg_obj = pdf.image_xobject(bg_id, bg_data);
+        bg_obj.filter(match bg_filter {
+            PdfFilter::Dct => pdf_writer::Filter::DctDecode,
+            PdfFilter::Jpx => pdf_writer::Filter::JpxDecode,
+        });
+        bg_obj.width(*bg_w as i32);
+        bg_obj.height(*bg_h as i32);
+        match bg_cs {
+            Cs::Gray => {
+                bg_obj.color_space().device_gray();
+            }
+            Cs::Rgb => {
+                bg_obj.color_space().device_rgb();
+            }
+        }
+        bg_obj.bits_per_component(8);
+        bg_obj.finish();
+
+        let mut mask_obj = pdf.image_xobject(mask_id, &frame.mask_g4);
+        mask_obj.filter(pdf_writer::Filter::CcittFaxDecode);
+        {
+            let mut parms = mask_obj.decode_parms();
+            parms
+                .k(-1)
+                .columns(frame.mask_w as i32)
+                .rows(frame.mask_h as i32)
+                .black_is_1(false);
+        }
+        mask_obj.width(frame.mask_w as i32);
+        mask_obj.height(frame.mask_h as i32);
+        mask_obj.image_mask(true);
+        mask_obj.bits_per_component(1);
+        // CCITT with BlackIs1=false decodes text pixels as 0. Invert the image mask
+        // so text samples paint with the current fill color and background stays transparent.
+        mask_obj.decode([1.0, 0.0]);
+        mask_obj.finish();
+
+        let mut content = Content::new();
+        content.save_state();
+        content.transform([page_width_pt, 0.0, 0.0, page_height_pt, 0.0, 0.0]);
+        content.x_object(Name(b"Bg"));
+        content.restore_state();
+        content.save_state();
+        content.set_fill_gray(0.0);
+        content.transform([page_width_pt, 0.0, 0.0, page_height_pt, 0.0, 0.0]);
+        content.x_object(Name(b"Mask"));
+        content.restore_state();
+        let content_data = content.finish();
+
+        pdf.stream(content_id, &content_data);
+
+        let mut page = pdf.page(page_id);
+        page.media_box(Rect::new(0.0, 0.0, page_width_pt, page_height_pt));
+        page.parent(page_tree_id);
+        page.contents(content_id);
+        {
+            let mut resources = page.resources();
+            let mut x_objects = resources.x_objects();
+            x_objects.pair(Name(b"Bg"), bg_id);
+            x_objects.pair(Name(b"Mask"), mask_id);
+        }
+        page.finish();
+    }
+
+    let mut pages = pdf.pages(page_tree_id);
+    pages.count(frames.len() as i32);
+    pages.kids(page_ids);
+    pages.finish();
+
+    pdf.catalog(catalog_id).pages(page_tree_id);
+
+    pdf.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1006,6 +1488,39 @@ mod tests {
         } else {
             encode_mozjpeg(&vec![128u8; (w * h * 3) as usize], w, h, 75, false).unwrap()
         }
+    }
+
+    fn make_text_scan() -> DynamicImage {
+        let mut img = RgbImage::from_fn(120, 80, |_, _| Rgb([245u8, 244, 238]));
+        for y in 20..36 {
+            for x in 15..23 {
+                img.put_pixel(x, y, Rgb([20, 20, 20]));
+            }
+            for x in 32..40 {
+                img.put_pixel(x, y, Rgb([25, 25, 25]));
+            }
+            for x in 49..57 {
+                img.put_pixel(x, y, Rgb([30, 30, 30]));
+            }
+        }
+        for y in 46..62 {
+            for x in 15..25 {
+                img.put_pixel(x, y, Rgb([20, 20, 20]));
+            }
+            for x in 34..44 {
+                img.put_pixel(x, y, Rgb([25, 25, 25]));
+            }
+        }
+        DynamicImage::ImageRgb8(img)
+    }
+
+    fn decode_g4_mask(bytes: &[u8], width: u16, height: u16) -> Vec<bool> {
+        let mut decoded = Vec::with_capacity(width as usize * height as usize);
+        let ok = fax::decoder::decode_g4(bytes.iter().copied(), width, Some(height), |line| {
+            decoded.extend(fax::decoder::pels(line, width).map(|c| c == FaxColor::Black));
+        });
+        assert!(ok.is_some(), "G4 decoder failed");
+        decoded
     }
 
     // ---- jpeg_component_count ------------------------------------------
@@ -1136,6 +1651,159 @@ mod tests {
             large.len() > small.len(),
             "2.0 bpp must be larger than 0.1 bpp"
         );
+    }
+
+    // ---- MRC-lite ------------------------------------------------------
+
+    #[test]
+    fn mrc_segmentation_detects_text_like_components() {
+        let img = make_text_scan();
+        let mask = segment_text_mask(&img);
+        assert!(
+            is_mrc_suitable(&mask),
+            "unexpected coverage: {:.2}%",
+            mask.coverage * 100.0
+        );
+        assert!(mask.pixels[(22 * mask.width + 18) as usize]);
+        assert!(!mask.pixels[0]);
+    }
+
+    #[test]
+    fn ccitt_g4_mask_roundtrips() {
+        let width = 16u32;
+        let height = 4u32;
+        let mut pixels = vec![false; (width * height) as usize];
+        for y in 0..height {
+            for x in 3..9 {
+                pixels[(y * width + x) as usize] = y % 2 == 0;
+            }
+        }
+        let coverage = pixels.iter().filter(|&&p| p).count() as f32 / (width * height) as f32;
+        let mask = TextMask {
+            width,
+            height,
+            coverage,
+            line_ratio: 0.0,
+            pixels,
+        };
+        let encoded = encode_text_mask_g4(&mask).unwrap();
+        let decoded = decode_g4_mask(&encoded, width as u16, height as u16);
+        assert_eq!(decoded, mask.pixels);
+    }
+
+    #[test]
+    fn mrc_background_fills_masked_text_pixels() {
+        let img = make_text_scan();
+        let mask = segment_text_mask(&img);
+        let bg = fill_masked_background(&img, &mask).to_rgb8();
+        let [r, g, b] = bg.get_pixel(18, 22).0;
+        assert!(r > 200 && g > 200 && b > 200, "text pixel was not filled");
+    }
+
+    #[test]
+    fn build_mrc_pdf_contains_background_and_ccitt_mask() {
+        let img = make_text_scan();
+        let images = vec![(PathBuf::from("page.png"), img)];
+        let sources = prepare_mrc_sources(&images).unwrap().unwrap();
+        let frames = encode_mrc_frames(&sources, 35, 0.5).unwrap();
+        let pdf = build_mrc_pdf(&frames);
+        let text = String::from_utf8_lossy(&pdf);
+        assert!(text.contains("DCTDecode"));
+        assert!(text.contains("CCITTFaxDecode"));
+        assert!(text.contains("ImageMask true"));
+        assert!(text.contains("/K -1"));
+    }
+
+    // ---- MRC defensive layers ------------------------------------------
+
+    #[test]
+    fn is_line_like_flags_long_thin_components() {
+        // Horizontal rule: 1 px tall, 300 px wide on an 800×600 page (> 15% of 800).
+        let mut h_rule = ComponentStats::new(100, 50);
+        for x in 100..400 {
+            h_rule.add(x, 50);
+        }
+        assert!(is_line_like(h_rule, 800, 600));
+
+        // Vertical rule: 1 px wide, 200 px tall on an 800×600 page (> 15% of 600).
+        let mut v_rule = ComponentStats::new(400, 50);
+        for y in 50..250 {
+            v_rule.add(400, y);
+        }
+        assert!(is_line_like(v_rule, 800, 600));
+
+        // A small glyph-like blob must not be flagged.
+        let mut glyph = ComponentStats::new(10, 10);
+        for x in 10..18 {
+            for y in 10..24 {
+                glyph.add(x, y);
+            }
+        }
+        assert!(!is_line_like(glyph, 800, 600));
+    }
+
+    /// Page dominated by isolated horizontal section rules — each one survives as its
+    /// own connected component, lifting line_ratio over the 0.30 gate.
+    fn make_table_scan() -> DynamicImage {
+        let (w, h) = (400u32, 400u32);
+        let mut img = RgbImage::from_fn(w, h, |_, _| Rgb([245u8, 245, 245]));
+        for row in [50u32, 110, 170, 230, 290, 350] {
+            for x in 20..380 {
+                img.put_pixel(x, row, Rgb([10u8, 10, 10]));
+                img.put_pixel(x, row + 1, Rgb([10u8, 10, 10]));
+            }
+        }
+        // Two glyph-sized blobs, fewer than the rules so line_ratio dominates.
+        for &(cy, cx) in &[(80u32, 50u32), (200u32, 100u32)] {
+            for y in cy..cy + 8 {
+                for x in cx..cx + 8 {
+                    img.put_pixel(x, y, Rgb([10u8, 10, 10]));
+                }
+            }
+        }
+        DynamicImage::ImageRgb8(img)
+    }
+
+    #[test]
+    fn mrc_rejects_table_heavy_page_via_line_ratio() {
+        let img = make_table_scan();
+        let mask = segment_text_mask(&img);
+        assert!(
+            mask.line_ratio > 0.30,
+            "expected high line_ratio, got {:.3}",
+            mask.line_ratio
+        );
+        assert!(
+            !is_mrc_suitable(&mask),
+            "MRC should skip a page dominated by table rules"
+        );
+    }
+
+    #[test]
+    fn mrc_median_filter_drops_oversized_outliers() {
+        // 15 body-sized glyphs + 1 giant block that should be pruned by the median filter.
+        let (w, h) = (400u32, 200u32);
+        let mut img = RgbImage::from_fn(w, h, |_, _| Rgb([245u8, 245, 245]));
+        for i in 0..15 {
+            let x0 = 20 + (i % 5) * 40;
+            let y0 = 20 + (i / 5) * 30;
+            for y in y0..y0 + 10 {
+                for x in x0..x0 + 8 {
+                    img.put_pixel(x, y, Rgb([10u8, 10, 10]));
+                }
+            }
+        }
+        // Oversized block: 120×80 — far outside [0.35×, 3.0×] of the ~10-px glyph median.
+        for y in 110..190 {
+            for x in 220..340 {
+                img.put_pixel(x, y, Rgb([10u8, 10, 10]));
+            }
+        }
+        let mask = segment_text_mask(&DynamicImage::ImageRgb8(img));
+        // A glyph pixel at (24, 24) should still be in the mask.
+        assert!(mask.pixels[(24 * mask.width + 24) as usize]);
+        // A pixel inside the oversized block must have been pruned.
+        assert!(!mask.pixels[(150 * mask.width + 280) as usize]);
     }
 
     // ---- build_pdf -----------------------------------------------------
