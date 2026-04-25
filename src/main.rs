@@ -46,15 +46,25 @@ struct TextMask {
     line_ratio: f32,
 }
 
+/// Encoding chosen for a text mask. Picked per page as whichever produces the smaller
+/// stream — JBIG2 wins on realistic A4 masks, G4 wins on tiny/sparse ones.
+#[derive(Clone, Copy)]
+enum MaskCodec {
+    Ccitt,
+    Jbig2,
+}
+
 struct MrcSource {
     background: image::DynamicImage,
     mask: TextMask,
-    mask_g4: Vec<u8>,
+    mask_data: Vec<u8>,
+    mask_codec: MaskCodec,
 }
 
 struct MrcFrame {
     background: Frame,
-    mask_g4: Vec<u8>,
+    mask_data: Vec<u8>,
+    mask_codec: MaskCodec,
     mask_w: u32,
     mask_h: u32,
 }
@@ -508,7 +518,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         println!("\n  JPEG q=...   : высокий q  = меньше артефактов (текст, чёткие края)");
         println!("  JP2 bpp=...  : меньший bpp = агрессивнее сжатие, мягче артефакты");
-        println!("  MRC mrc-q=...: q управляет только JPEG-фоном; текст идёт 1-битной G4-маской");
+        println!(
+            "  MRC mrc-q=...: q — это JPEG-фон; текст идёт 1-битной маской (JBIG2 или G4 — что меньше)"
+        );
         println!("  Высокий scale = больше деталей и разрешение (мелкие элементы)");
     }
 
@@ -885,6 +897,29 @@ fn encode_text_mask_g4(mask: &TextMask) -> Result<Vec<u8>, Box<dyn std::error::E
     Ok(encoder.finish()?.finish())
 }
 
+fn mask_to_jbig2_pixels(mask: &TextMask) -> Vec<u8> {
+    let mut buf = Vec::with_capacity((mask.width * mask.height) as usize);
+    for &p in &mask.pixels {
+        buf.push(if p { 1u8 } else { 0u8 });
+    }
+    buf
+}
+
+/// Encode the mask as a standalone JBIG2 page stream (no global dictionary), ready for
+/// `JBIG2Decode` in PDF. Uses the lossless variant: substitution errors are not safe for
+/// documents that may contain digits or critical glyphs.
+fn encode_text_mask_jbig2(mask: &TextMask) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let buf = mask_to_jbig2_pixels(mask);
+    let result = jbig2enc_rust::encode_single_image_lossless(&buf, mask.width, mask.height, true)
+        .map_err(|e| format!("JBIG2 encode failed: {:?}", e))?;
+    // The lossless path forces standalone streams (no global dictionary). Asserting
+    // surfaces upstream regressions early instead of producing broken PDFs.
+    if result.global_data.is_some() {
+        return Err("JBIG2: lossless path unexpectedly produced a global dictionary".into());
+    }
+    Ok(result.page_data)
+}
+
 fn prepare_mrc_sources(
     images: &[(PathBuf, image::DynamicImage)],
 ) -> Result<Option<Vec<MrcSource>>, Box<dyn std::error::Error>> {
@@ -900,11 +935,20 @@ fn prepare_mrc_sources(
             return Ok(None);
         }
         let background = fill_masked_background(img, &mask);
-        let mask_g4 = encode_text_mask_g4(&mask)?;
+        // Encode both and pick the smaller. JBIG2 typically wins on A4-sized text masks
+        // by 2–3×; G4 wins on tiny masks where JBIG2's fixed overhead dominates.
+        let g4 = encode_text_mask_g4(&mask)?;
+        let jbig2 = encode_text_mask_jbig2(&mask)?;
+        let (mask_data, mask_codec) = if jbig2.len() < g4.len() {
+            (jbig2, MaskCodec::Jbig2)
+        } else {
+            (g4, MaskCodec::Ccitt)
+        };
         sources.push(MrcSource {
             background,
             mask,
-            mask_g4,
+            mask_data,
+            mask_codec,
         });
     }
     Ok(Some(sources))
@@ -921,7 +965,8 @@ fn encode_mrc_frames(
             let background = encode_raster_as_jpeg(&source.background, bg_quality, bg_scale)?;
             Ok(MrcFrame {
                 background,
-                mask_g4: source.mask_g4.clone(),
+                mask_data: source.mask_data.clone(),
+                mask_codec: source.mask_codec,
                 mask_w: source.mask.width,
                 mask_h: source.mask.height,
             })
@@ -1421,22 +1466,28 @@ fn build_mrc_pdf(frames: &[MrcFrame]) -> Vec<u8> {
         bg_obj.bits_per_component(8);
         bg_obj.finish();
 
-        let mut mask_obj = pdf.image_xobject(mask_id, &frame.mask_g4);
-        mask_obj.filter(pdf_writer::Filter::CcittFaxDecode);
-        {
-            let mut parms = mask_obj.decode_parms();
-            parms
-                .k(-1)
-                .columns(frame.mask_w as i32)
-                .rows(frame.mask_h as i32)
-                .black_is_1(false);
+        let mut mask_obj = pdf.image_xobject(mask_id, &frame.mask_data);
+        match frame.mask_codec {
+            MaskCodec::Ccitt => {
+                mask_obj.filter(pdf_writer::Filter::CcittFaxDecode);
+                let mut parms = mask_obj.decode_parms();
+                parms
+                    .k(-1)
+                    .columns(frame.mask_w as i32)
+                    .rows(frame.mask_h as i32)
+                    .black_is_1(false);
+            }
+            MaskCodec::Jbig2 => {
+                // Standalone JBIG2 page stream — no global dictionary, no DecodeParms.
+                mask_obj.filter(pdf_writer::Filter::Jbig2Decode);
+            }
         }
         mask_obj.width(frame.mask_w as i32);
         mask_obj.height(frame.mask_h as i32);
         mask_obj.image_mask(true);
         mask_obj.bits_per_component(1);
-        // CCITT with BlackIs1=false decodes text pixels as 0. Invert the image mask
-        // so text samples paint with the current fill color and background stays transparent.
+        // Both decoders place text on the "filled" side of the mask in our setup; the
+        // [1.0, 0.0] decode array maps that to PDF's "0 = paint, 1 = transparent".
         mask_obj.decode([1.0, 0.0]);
         mask_obj.finish();
 
@@ -1700,8 +1751,35 @@ mod tests {
         assert!(r > 200 && g > 200 && b > 200, "text pixel was not filled");
     }
 
+    /// Build a wide A4-sized synthetic mask with hundreds of glyph-like blocks. JBIG2
+    /// dominates G4 on inputs at this scale, so it exercises the JBIG2 PDF path.
+    fn make_large_text_mask() -> TextMask {
+        let (w, h) = (1240u32, 1754u32);
+        let mut pixels = vec![false; (w * h) as usize];
+        let mut text_pixels = 0usize;
+        for line in 0..40 {
+            let y0 = 60 + line * 40;
+            for col in 0..50 {
+                let x0 = 60 + col * 22;
+                for y in y0..(y0 + 12).min(h) {
+                    for x in x0..(x0 + 8).min(w) {
+                        pixels[(y * w + x) as usize] = true;
+                        text_pixels += 1;
+                    }
+                }
+            }
+        }
+        TextMask {
+            width: w,
+            height: h,
+            coverage: text_pixels as f32 / (w as f32 * h as f32),
+            line_ratio: 0.0,
+            pixels,
+        }
+    }
+
     #[test]
-    fn build_mrc_pdf_contains_background_and_ccitt_mask() {
+    fn build_mrc_pdf_uses_a_supported_mask_filter() {
         let img = make_text_scan();
         let images = vec![(PathBuf::from("page.png"), img)];
         let sources = prepare_mrc_sources(&images).unwrap().unwrap();
@@ -1709,9 +1787,99 @@ mod tests {
         let pdf = build_mrc_pdf(&frames);
         let text = String::from_utf8_lossy(&pdf);
         assert!(text.contains("DCTDecode"));
-        assert!(text.contains("CCITTFaxDecode"));
         assert!(text.contains("ImageMask true"));
-        assert!(text.contains("/K -1"));
+        // Mask filter is auto-selected; either CCITT G4 or JBIG2 is acceptable.
+        assert!(
+            text.contains("CCITTFaxDecode") || text.contains("JBIG2Decode"),
+            "expected a 1-bit mask filter, found neither"
+        );
+    }
+
+    // ---- JBIG2 ---------------------------------------------------------
+
+    #[test]
+    fn jbig2_encodes_non_empty_stream_and_is_lossless_only() {
+        // Lossless mode must produce a standalone stream (no global dictionary):
+        // global dictionaries would require a separate PDF object reference, which the
+        // current build_mrc_pdf does not emit.
+        let mask = make_large_text_mask();
+        let bytes = encode_text_mask_jbig2(&mask).unwrap();
+        assert!(!bytes.is_empty(), "JBIG2 produced an empty stream");
+    }
+
+    #[test]
+    fn jbig2_beats_ccitt_g4_on_realistic_mask() {
+        let mask = make_large_text_mask();
+        let g4 = encode_text_mask_g4(&mask).unwrap();
+        let jbig2 = encode_text_mask_jbig2(&mask).unwrap();
+        assert!(
+            jbig2.len() < g4.len(),
+            "expected JBIG2 < G4 on a 1240×1754 text mask, got jbig2={} g4={}",
+            jbig2.len(),
+            g4.len()
+        );
+    }
+
+    #[test]
+    fn build_mrc_pdf_emits_jbig2_filter_when_jbig2_wins() {
+        // Prepare an MrcSource that explicitly uses JBIG2, bypassing auto-selection,
+        // so the PDF path that emits /JBIG2Decode is exercised even if a future mask
+        // happens to be smaller in G4.
+        let mask = make_large_text_mask();
+        let bytes = encode_text_mask_jbig2(&mask).unwrap();
+        let bg = DynamicImage::ImageRgb8(RgbImage::from_fn(40, 40, |_, _| Rgb([240u8, 240, 240])));
+        let bg_frame = encode_raster_as_jpeg(&bg, 50, 1.0).unwrap();
+        let frame = MrcFrame {
+            background: bg_frame,
+            mask_data: bytes,
+            mask_codec: MaskCodec::Jbig2,
+            mask_w: mask.width,
+            mask_h: mask.height,
+        };
+        let pdf = build_mrc_pdf(&[frame]);
+        let text = String::from_utf8_lossy(&pdf);
+        assert!(text.contains("JBIG2Decode"));
+        assert!(text.contains("ImageMask true"));
+        // No DecodeParms /K for JBIG2: that's CCITT-only.
+        assert!(!text.contains("/K -1"));
+    }
+
+    /// Round-trips a known mask through the JBIG2 encoder and an independent decoder,
+    /// asserting pixel-exact equality. Symmetric to `ccitt_g4_mask_roundtrips`.
+    ///
+    /// Catches: bool→byte-mapping inversion, encoder regressions, decoder pairing
+    /// mismatches — anything where text pixels would silently end up where background
+    /// pixels should be (or vice versa).
+    ///
+    /// Encodes with `pdf_mode=false` here to get a parseable standalone JBIG2 file
+    /// (justbig2 needs the file header). The wire format of the page-level segments is
+    /// identical to what `encode_text_mask_jbig2` emits for PDF embedding — only the
+    /// outer file framing differs.
+    #[test]
+    fn jbig2_mask_round_trips_through_decoder() {
+        let mask = make_large_text_mask();
+        let buf = mask_to_jbig2_pixels(&mask);
+        let encoded =
+            jbig2enc_rust::encode_single_image_lossless(&buf, mask.width, mask.height, false)
+                .unwrap();
+        // Lossless path must not produce a global dictionary; that's enforced separately.
+        assert!(encoded.global_data.is_none());
+
+        let mut decoder = justbig2::Decoder::new();
+        decoder.write(&encoded.page_data).unwrap();
+        let page = decoder.page().expect("decoder produced no page");
+
+        assert_eq!(page.width, mask.width);
+        assert_eq!(page.height, mask.height);
+
+        for y in 0..mask.height {
+            for x in 0..mask.width {
+                let idx = (y * mask.width + x) as usize;
+                let expected = if mask.pixels[idx] { 1u8 } else { 0u8 };
+                let actual = page.get_pixel(x, y);
+                assert_eq!(actual, expected, "pixel mismatch at ({x},{y})");
+            }
+        }
     }
 
     // ---- MRC defensive layers ------------------------------------------

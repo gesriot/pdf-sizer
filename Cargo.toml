@@ -10,3 +10,7 @@ mozjpeg = "0.10"
 imageproc = "0.26"
 openjp2 = "0.6"
 fax = "0.2"
+jbig2enc-rust = "0.5"
+
+[dev-dependencies]
+justbig2 = "0.2"
