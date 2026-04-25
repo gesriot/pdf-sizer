@@ -1,5 +1,6 @@
 mod cli;
 mod engine;
+mod gui;
 mod progress;
 
 use clap::Parser;
@@ -7,10 +8,8 @@ use clap::Parser;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
 
-    // Preserve the old no-args output exactly; clap would print a different help text.
     if args.len() < 2 {
-        cli::print_legacy_usage(&args[0]);
-        std::process::exit(1);
+        return gui::run_gui();
     }
 
     // Preserve the positional target form (`pdf-sizer 20`) before clap sees it.

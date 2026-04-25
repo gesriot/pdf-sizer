@@ -88,6 +88,11 @@ pub(crate) fn collect_images(dir: &Path) -> Result<Vec<PathBuf>, Box<dyn std::er
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
         .filter(|path| {
+            !path
+                .components()
+                .any(|component| component.as_os_str() == "pdf-sizer-output")
+        })
+        .filter(|path| {
             path.extension()
                 .and_then(|ext| ext.to_str())
                 .map(|ext| extensions.contains(&ext.to_lowercase().as_str()))

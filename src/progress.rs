@@ -108,7 +108,6 @@ impl ProgressReporter for NoopReporter {
 pub(crate) struct CancellationToken(Arc<AtomicBool>);
 
 impl CancellationToken {
-    #[cfg_attr(not(test), expect(dead_code, reason = "GUI cancel will call this"))]
     pub(crate) fn cancel(&self) {
         self.0.store(true, Ordering::Relaxed);
     }

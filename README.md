@@ -1,95 +1,135 @@
 # pdf-sizer
 
-A command-line tool that converts a folder of images into PDF files, automatically finding the best quality/scale combinations that hit a target file size.
+Pack a folder of scanned images into compact PDFs that hit a target file size.
+The tool generates multiple variants, each at the same size but with a different
+quality/scale trade-off — you pick the one that looks best.
 
-## The Problem
+Supports JPEG, JPEG 2000, and MRC (Mixed Raster Content) compression, plus
+optional scan preprocessing (despeckle, background flattening, deskew).
 
-When embedding images into a PDF, the resulting file size is often unpredictable. JPEG or PNG files that sum to your desired size may produce a much larger PDF when packaged together – because most PDF libraries decode images and re-store them as raw pixels. This tool solves that by embedding JPEG data directly into the PDF stream (DCTDecode filter), making the file size predictable and controllable.
+---
 
-## How It Works
+## Quick start
 
-Instead of producing a single PDF, the tool generates **multiple variants** – each with the same target file size but a different quality/scale tradeoff:
+```bash
+# GUI (default when launched without arguments)
+pdf-sizer
 
-- **High quality, low scale** – fewer compression artifacts, sharper edges and text, but lower resolution
-- **Low quality, high scale** – more compression artifacts, but higher resolution with more fine detail
+# CLI
+pdf-sizer run --input ./scans --target-mb 20
 
-For each JPEG quality level (100, 95, 90, ... down to 5), the tool runs a **binary search** over the scale factor to find the exact scale that produces a PDF within ±2 MB of your target. Only successful variants are saved to disk.
+# Legacy shorthand (deprecated)
+pdf-sizer 20          # reads ./images/ next to the binary
+```
+
+---
+
+## How it works
+
+For each quality level the tool runs a **binary search** over the scale factor
+to find the exact downscale that produces a PDF within `target ± tolerance`.
+Only variants that land inside the window are saved.
 
 ```
-quality=100, scale=62%  →  variant_q100_s062.pdf  (19.8 MB)   ← sharper
-quality= 90, scale=73%  →  variant_q090_s073.pdf  (19.5 MB)
-quality= 80, scale=82%  →  variant_q080_s082.pdf  (19.9 MB)
-quality= 70, scale=91%  →  variant_q070_s091.pdf  (19.7 MB)   ← more detail
+JPEG q=100  scale=77%  →  variant_q100_s077.pdf   (19.9 MB)  ← sharpest text
+JPEG q=99   scale=83%  →  variant_q099_s083.pdf   (20.1 MB)
+JPEG q=98   scale=89%  →  variant_q098_s089.pdf   (20.0 MB)
+JPEG q=97   scale=95%  →  variant_q097_s095.pdf   (19.8 MB)  ← most detail
 ```
 
-You open all variants and pick whichever looks best for your specific images.
+Results are sorted by file size (largest first) so the highest-quality
+variants appear at the top. A **Recommended** section highlights four
+picks automatically: best for text, balanced, maximum detail, smallest.
 
-## Technical Details
+---
 
-- Images are resized using the **Lanczos3** filter (high-quality downscaling)
-- JPEG bytes are embedded in the PDF with the **DCTDecode** filter – the original compressed data is stored as-is, not re-encoded
-- PDF size ≈ sum of JPEG sizes + ~300 bytes overhead per page
-- Built with [`pdf-writer`](https://crates.io/crates/pdf-writer) and [`image`](https://crates.io/crates/image)
+## Compression modes
 
-## Installation
+| Mode | Filter in PDF | Best for |
+|---|---|---|
+| `jpeg` (default) | `DCTDecode` | General purpose; fastest |
+| `jp2` | `JPXDecode` | Better at low bitrates; softer artefacts |
+| `mrc` | `CCITTFaxDecode`/`JBIG2Decode` + `DCTDecode` | Scanned text: 1-bit mask for text, compressed JPEG background |
+| `auto` | all three | Generates JPEG + JP2 + MRC variants in one run |
 
-### Prerequisites
+MRC stores text as a lossless 1-bit mask (JBIG2 or CCITT G4, whichever is
+smaller) over a heavily compressed background — similar to what ABBYY
+FineReader uses internally.
 
-- [Rust](https://rustup.rs/) (edition 2024, Rust 1.85+)
+---
 
-### Build
+## Preprocessing
+
+Optional scan cleanup applied before compression (does not affect source files):
+
+| Flag | Effect |
+|---|---|
+| `--despeckle` | 3×3 median filter — removes scanner noise |
+| `--flatten[=N]` | Background flattening — evens out paper colour/texture; N = aggressiveness 0–255, default 30 |
+| `--deskew` | Auto-detects and corrects page tilt (±10°) |
+
+---
+
+## CLI reference
+
+```
+pdf-sizer run --input <DIR> [--output <DIR>] --target-mb <N>
+              [--despeckle] [--flatten[=<0-255>]] [--deskew]
+              [--codec=jpeg|jp2|mrc|auto]
+
+Options:
+  --input          Source folder with images
+  --output         Destination folder for PDF variants
+                   Default: <input>/pdf-sizer-output/<timestamp>/
+  --target-mb      Target file size in megabytes
+  --codec          Compression mode (default: jpeg)
+  --despeckle      Apply median filter
+  --flatten[=N]    Flatten background (N = strength, default 30)
+  --deskew         Correct page skew
+```
+
+The tolerance window defaults to **10 % of target** (e.g. ±2 MB for a 20 MB
+target). Adjust it in the GUI with the `±` field next to the size slider.
+
+---
+
+## GUI
+
+Launch without arguments or with `pdf-sizer gui`. Requires a display.
+
+On macOS, prefer launching via double-click or `open ./pdf-sizer` to get a
+proper application lifecycle (running from a terminal that is later closed
+will kill the process via SIGHUP).
+
+---
+
+## Build
+
+Requires Rust 1.85+ (edition 2024) and a C compiler (for MozJPEG and
+OpenJPEG, both built automatically from source).
 
 ```bash
 git clone <repo>
-cd pdf-converter
+cd pdf-sizer
 cargo build --release
 ```
 
-The binary will be at `target/release/pdf-sizer` (or `pdf-sizer.exe` on Windows).
+Binary: `target/release/pdf-sizer`
 
-## Usage
+---
 
-1. Create an `images/` folder **next to the binary**:
-   ```
-   target/release/
-   ├── pdf-sizer.exe
-   └── images/
-       ├── page_01.jpg
-       ├── page_02.png
-       └── ...
-   ```
-
-2. Run with your target size in megabytes:
-   ```bash
-   pdf-sizer 20
-   ```
-
-3. The tool prints progress and saves all variants in the current directory:
-   ```
-   Found images: 5
-   Target size: 20 MB (±2 MB)
-
-   Searching variants: finding scale for each quality level...
-
-     quality=100, scale= 62% -> variant_q100_s062.pdf (19.8 MB)
-     quality= 95, scale= 68% -> variant_q095_s068.pdf (20.3 MB)
-     quality= 90, scale= 73% -> variant_q090_s073.pdf (19.5 MB)
-     quality= 85, scale= 77% -> variant_q085_s077.pdf (20.1 MB)
-     quality= 80, scale= 82% -> variant_q080_s082.pdf (19.9 MB)
-     quality= 65: even at scale=100% size is 18.1 MB – below target, stopping
-
-   --- Summary ---
-   Variants created: 5
-   ```
-
-4. Open the variants and visually pick the one that looks best.
-
-## Supported Image Formats
+## Supported image formats
 
 `jpg`, `jpeg`, `png`, `bmp`, `tiff`, `tif`, `webp`
 
-Images are sorted alphabetically, which determines the page order in the PDF.
+Images are sorted alphabetically — that order becomes the page order in the PDF.
 
-## Output Files
+---
 
-Output files are named `variant_q{quality}_s{scale}.pdf` and saved in the **working directory** (where you run the command from), not next to the binary.
+## Output files
+
+| Codec | File name pattern |
+|---|---|
+| JPEG | `variant_q{quality}_s{scale}.pdf` |
+| JPEG 2000 | `variant_jp2_b{bpp×100}_s{scale}.pdf` |
+| MRC | `variant_mrc_q{bg-quality}_s{scale}.pdf` |

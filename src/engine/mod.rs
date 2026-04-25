@@ -38,6 +38,8 @@ pub(crate) struct RunOpts {
     pub(crate) input: PathBuf,
     pub(crate) output: PathBuf,
     pub(crate) target_mb: f64,
+    /// Accepted deviation from target_mb (±). Variants outside [target±tolerance] are skipped.
+    pub(crate) tolerance_mb: f64,
     pub(crate) preproc: PreprocOpts,
     pub(crate) codec: CodecChoice,
 }
@@ -60,6 +62,15 @@ struct VariantRecord {
     setting: String,
     scale_pct: u32,
     size_bytes: u64,
+}
+
+/// Format a megabyte value with just enough decimal places to be non-zero.
+fn fmt_mb(mb: f64) -> String {
+    if mb < 0.05 {
+        format!("{:.2}", mb)
+    } else {
+        format!("{:.1}", mb)
+    }
 }
 
 fn report_info(reporter: &dyn ProgressReporter, message: impl Into<String>) {
@@ -262,7 +273,7 @@ fn run_search_inner(
     check_cancel(cancel)?;
 
     let target_bytes = (run_opts.target_mb * 1024.0 * 1024.0) as u64;
-    let tolerance_bytes = (2.0 * 1024.0 * 1024.0) as u64;
+    let tolerance_bytes = (run_opts.tolerance_mb * 1024.0 * 1024.0) as u64;
 
     let images_dir = &run_opts.input;
 
@@ -293,7 +304,11 @@ fn run_search_inner(
     );
     report_info(
         reporter,
-        format!("Целевой размер: {:.0} MB (±2 MB)", run_opts.target_mb),
+        format!(
+            "Целевой размер: {} MB (±{} MB)",
+            fmt_mb(run_opts.target_mb),
+            fmt_mb(run_opts.tolerance_mb)
+        ),
     );
     if run_opts.preproc.despeckle
         || run_opts.preproc.flatten_threshold > 0
@@ -337,7 +352,13 @@ fn run_search_inner(
     let run_jp2 = matches!(run_opts.codec, CodecChoice::Jp2 | CodecChoice::Auto);
     let run_mrc = matches!(run_opts.codec, CodecChoice::Mrc | CodecChoice::Auto);
 
-    let quality_steps: Vec<u8> = (1..=20).rev().map(|i| i * 5).collect(); // 100, 95, ..., 5
+    // Step=1 gives the user adjacent quality levels (q=100, q=99, q=98…) rather
+    // than coarse 5-step jumps. With a tight tolerance (≤10 % of target) the
+    // early-exit break fires after only a handful of levels, so the extra cost
+    // over step=5 is small in practice. A coarse+refine approach would give the
+    // same result with fewer probes, but adds complexity without a clear win at
+    // typical tolerances. Revisit if large batches become slow.
+    let quality_steps: Vec<u8> = (1..=100).rev().collect(); // 100, 99, ..., 1
     let mut variants: Vec<CreatedVariant> = Vec::new();
 
     if run_jpeg {
@@ -937,6 +958,7 @@ mod tests {
             input: PathBuf::from("does-not-matter"),
             output: PathBuf::from("."),
             target_mb: 1.0,
+            tolerance_mb: 0.1,
             preproc: PreprocOpts {
                 despeckle: false,
                 flatten_threshold: 0,
@@ -970,6 +992,7 @@ mod tests {
             input: PathBuf::from("__missing_pdf_sizer_test_input__"),
             output: PathBuf::from("."),
             target_mb: 1.0,
+            tolerance_mb: 0.1,
             preproc: PreprocOpts {
                 despeckle: false,
                 flatten_threshold: 0,

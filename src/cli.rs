@@ -23,6 +23,8 @@ pub(crate) struct Cli {
 enum Command {
     /// Подобрать PDF-варианты из указанной папки изображений
     Run(RunArgs),
+    /// Открыть native GUI
+    Gui,
 }
 
 #[derive(Args, Debug)]
@@ -141,17 +143,10 @@ impl ProgressReporter for StdoutReporter {
     }
 }
 
-pub(crate) fn print_legacy_usage(program: &str) {
-    eprintln!(
-        "Использование: {} <МБ> [--despeckle] [--flatten[=<0-255>]] [--deskew] [--codec=jpeg|jp2|mrc|auto]",
-        program
-    );
-    eprintln!("Изображения берутся из папки images/ рядом с исполняемым файлом");
-}
-
 pub(crate) fn dispatch(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Command::Run(args) => run_command(args),
+        Command::Gui => crate::gui::run_gui(),
     }
 }
 
@@ -173,6 +168,7 @@ pub(crate) fn run_legacy(args: &[String]) -> Result<(), Box<dyn std::error::Erro
         input: exe_dir.join("images"),
         output: PathBuf::from("."),
         target_mb,
+        tolerance_mb: default_tolerance(target_mb),
         preproc,
         codec,
     };
@@ -184,9 +180,10 @@ fn run_command(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         .output
         .unwrap_or_else(|| default_output_dir(&args.input));
     let opts = RunOpts {
+        target_mb: args.target_mb,
+        tolerance_mb: default_tolerance(args.target_mb),
         input: args.input,
         output,
-        target_mb: args.target_mb,
         preproc: PreprocOpts {
             despeckle: args.despeckle,
             flatten_threshold: args.flatten.unwrap_or(0),
@@ -264,6 +261,11 @@ fn parse_legacy_args(
         .map_err(|_| "целевой размер не является числом")?;
 
     Ok((target_mb, preproc, codec))
+}
+
+/// 10 % of target — same formula the GUI uses before the user edits the field.
+fn default_tolerance(target_mb: f64) -> f64 {
+    target_mb * 0.1
 }
 
 fn default_output_dir(input: &Path) -> PathBuf {
