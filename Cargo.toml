@@ -1,7 +1,8 @@
 [package]
 name = "pdf-sizer"
-version = "0.1.0"
+version = "2.0.0"
 edition = "2024"
+description = "GUI + CLI tool to pack scanned images into PDFs at a target file size, with JPEG, JPEG 2000 and MRC compression and optional scan preprocessing"
 
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
