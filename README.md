@@ -135,3 +135,8 @@ Images are sorted alphabetically – that order becomes the page order in the PD
 | JPEG | `variant_q{quality}_s{scale}.pdf` |
 | JPEG 2000 | `variant_jp2_b{bpp×100}_s{scale}.pdf` |
 | MRC | `variant_mrc_q{bg-quality}_s{scale}.pdf` |
+
+## License
+
+MIT – see [LICENSE](LICENSE).
+
