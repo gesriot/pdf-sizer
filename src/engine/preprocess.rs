@@ -2,12 +2,18 @@ use imageproc::contrast::{ThresholdType, otsu_level, threshold};
 use imageproc::filter::median_filter;
 use imageproc::geometric_transformations::{Interpolation, rotate_about_center_no_crop};
 
+use crate::progress::{LogLevel, ProgressEvent, ProgressReporter};
+
 use super::types::PreprocOpts;
 
-pub(crate) fn preprocess(img: image::DynamicImage, opts: &PreprocOpts) -> image::DynamicImage {
+pub(crate) fn preprocess(
+    img: image::DynamicImage,
+    opts: &PreprocOpts,
+    reporter: &dyn ProgressReporter,
+) -> image::DynamicImage {
     let mut img = img;
     if opts.deskew {
-        img = apply_deskew(img);
+        img = apply_deskew(img, reporter);
     }
     if opts.despeckle {
         img = apply_despeckle(img);
@@ -136,14 +142,17 @@ fn detect_skew_angle(luma: &image::GrayImage) -> f32 {
     best_angle
 }
 
-fn apply_deskew(img: image::DynamicImage) -> image::DynamicImage {
+fn apply_deskew(img: image::DynamicImage, reporter: &dyn ProgressReporter) -> image::DynamicImage {
     let angle = detect_skew_angle(&img.to_luma8());
 
     if angle.abs() < 0.25 {
         return img;
     }
 
-    println!("  [deskew] обнаружен наклон {:.1}°, исправляю", angle);
+    reporter.report(ProgressEvent::Log {
+        level: LogLevel::Info,
+        message: format!("  [deskew] обнаружен наклон {:.1}°, исправляю", angle),
+    });
 
     // Rotate clockwise by -angle to compensate.
     let theta = -angle.to_radians();

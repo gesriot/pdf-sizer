@@ -5,6 +5,9 @@ use chrono::Local;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::engine::{self, CodecChoice, PreprocOpts, RunOpts};
+use crate::progress::{
+    CancellationToken, FinishStatus, LogLevel, ProgressEvent, ProgressReporter, RecommendationKind,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -66,6 +69,78 @@ impl From<CodecArg> for CodecChoice {
     }
 }
 
+pub(crate) struct StdoutReporter;
+
+impl ProgressReporter for StdoutReporter {
+    fn report(&self, event: ProgressEvent) {
+        match event {
+            ProgressEvent::Log { level, message } => match level {
+                LogLevel::Info => println!("{message}"),
+                LogLevel::Warning | LogLevel::Error => eprintln!("{message}"),
+            },
+            ProgressEvent::Phase(phase) => {
+                let _ = phase;
+            }
+            ProgressEvent::ImagesFound { count } => {
+                let _ = count;
+            }
+            ProgressEvent::CurrentPage { path, index, total } => {
+                let _ = (path, index, total);
+            }
+            ProgressEvent::SettingStarted {
+                codec,
+                setting,
+                index,
+                total,
+            } => {
+                let _ = (codec, setting, index, total);
+            }
+            ProgressEvent::Probe {
+                setting,
+                scale,
+                size_bytes,
+            } => {
+                let _ = (setting, scale, size_bytes);
+            }
+            ProgressEvent::VariantReady(info) => {
+                let _ = (
+                    info.id,
+                    info.filename,
+                    info.codec,
+                    info.setting,
+                    info.scale_pct,
+                    info.size_bytes,
+                );
+            }
+            ProgressEvent::SettingSkipped {
+                codec,
+                setting,
+                reason,
+            } => {
+                let _ = (codec, setting, reason);
+            }
+            ProgressEvent::Recommendations(recommendations) => {
+                for recommendation in recommendations {
+                    match recommendation {
+                        RecommendationKind::BestForText(id)
+                        | RecommendationKind::Balanced(id)
+                        | RecommendationKind::MaxDetail(id)
+                        | RecommendationKind::Smallest(id) => {
+                            let _ = id;
+                        }
+                    }
+                }
+            }
+            ProgressEvent::Finished { status } => match status {
+                FinishStatus::Success | FinishStatus::Cancelled => {}
+                FinishStatus::Failed(message) => {
+                    let _ = message;
+                }
+            },
+        }
+    }
+}
+
 pub(crate) fn print_legacy_usage(program: &str) {
     eprintln!(
         "Использование: {} <МБ> [--despeckle] [--flatten[=<0-255>]] [--deskew] [--codec=jpeg|jp2|mrc|auto]",
@@ -82,6 +157,14 @@ pub(crate) fn dispatch(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
 pub(crate) fn run_legacy(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let (target_mb, preproc, codec) = parse_legacy_args(args)?;
+    let reporter = StdoutReporter;
+    reporter.report(ProgressEvent::Log {
+        level: LogLevel::Warning,
+        message: format!(
+            "pdf-sizer {} устарело, используйте pdf-sizer run --target-mb {} --input <DIR>",
+            args[0], args[0]
+        ),
+    });
     let exe_dir = env::current_exe()?
         .parent()
         .unwrap_or(Path::new("."))
@@ -93,8 +176,7 @@ pub(crate) fn run_legacy(args: &[String]) -> Result<(), Box<dyn std::error::Erro
         preproc,
         codec,
     };
-    engine::run_search(&opts)?;
-    Ok(())
+    run_engine_with_reporter(&opts, &reporter)
 }
 
 fn run_command(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -112,8 +194,23 @@ fn run_command(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
         },
         codec: args.codec.into(),
     };
-    engine::run_search(&opts)?;
-    Ok(())
+    run_engine(&opts)
+}
+
+fn run_engine(opts: &RunOpts) -> Result<(), Box<dyn std::error::Error>> {
+    let reporter = StdoutReporter;
+    run_engine_with_reporter(opts, &reporter)
+}
+
+fn run_engine_with_reporter(
+    opts: &RunOpts,
+    reporter: &dyn ProgressReporter,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cancel = CancellationToken::default();
+    match engine::run_search(opts, reporter, &cancel) {
+        Ok(_) => Ok(()),
+        Err(_) => std::process::exit(1),
+    }
 }
 
 fn parse_legacy_args(

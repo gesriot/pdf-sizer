@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -15,6 +16,11 @@ use mrc::{encode_mrc_frames, estimate_mrc_size, prepare_mrc_sources};
 use pdf::{build_mrc_pdf, build_pdf};
 use preprocess::preprocess;
 use types::Frame;
+
+use crate::progress::{
+    CancellationToken, Cancelled, EngineMessage, FinishStatus, LogLevel, ProgressEvent,
+    ProgressReporter, RecommendationKind, SearchPhase, VariantInfo,
+};
 
 #[cfg(test)]
 use encode::{
@@ -36,41 +42,259 @@ pub(crate) struct RunOpts {
     pub(crate) codec: CodecChoice,
 }
 
+pub(crate) struct SearchSummary {
+    pub(crate) variants: Vec<VariantInfo>,
+    pub(crate) recommendations: Vec<RecommendationKind>,
+}
+
+struct CreatedVariant {
+    info: VariantInfo,
+    display_filename: String,
+    size_mb: f64,
+}
+
+struct VariantRecord {
+    filename: PathBuf,
+    display_filename: String,
+    codec: CodecChoice,
+    setting: String,
+    scale_pct: u32,
+    size_bytes: u64,
+}
+
+fn report_info(reporter: &dyn ProgressReporter, message: impl Into<String>) {
+    reporter.report(ProgressEvent::Log {
+        level: LogLevel::Info,
+        message: message.into(),
+    });
+}
+
+fn check_cancel(cancel: &CancellationToken) -> Result<(), Box<dyn std::error::Error>> {
+    if cancel.is_cancelled() {
+        Err(Box::new(Cancelled))
+    } else {
+        Ok(())
+    }
+}
+
 fn write_variant(
     output: &Path,
     filename: &str,
     bytes: &[u8],
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<(PathBuf, String), Box<dyn std::error::Error>> {
     let path = output.join(filename);
     fs::write(&path, bytes)?;
-    if output == Path::new(".") {
-        Ok(filename.to_string())
+    let display_filename = if output == Path::new(".") {
+        filename.to_string()
     } else {
-        Ok(path.display().to_string())
+        path.display().to_string()
+    };
+    let filename = fs::canonicalize(&path).unwrap_or(path);
+    Ok((filename, display_filename))
+}
+
+fn record_variant(
+    variants: &mut Vec<CreatedVariant>,
+    reporter: &dyn ProgressReporter,
+    record: VariantRecord,
+) {
+    let info = VariantInfo {
+        id: variants.len(),
+        filename: record.filename,
+        codec: record.codec,
+        setting: record.setting,
+        scale_pct: record.scale_pct,
+        size_bytes: record.size_bytes,
+    };
+    reporter.report(ProgressEvent::VariantReady(info.clone()));
+    variants.push(CreatedVariant {
+        info,
+        display_filename: record.display_filename,
+        size_mb: record.size_bytes as f64 / (1024.0 * 1024.0),
+    });
+}
+
+fn setting_u8(setting: &str, prefix: &str) -> Option<u8> {
+    setting.strip_prefix(prefix)?.parse().ok()
+}
+
+fn distance_to_target(size_bytes: u64, target_bytes: u64) -> u64 {
+    size_bytes.abs_diff(target_bytes)
+}
+
+fn push_recommendation(
+    recommendations: &mut Vec<RecommendationKind>,
+    used: &mut Vec<usize>,
+    id: usize,
+    make: impl FnOnce(usize) -> RecommendationKind,
+) {
+    if !used.contains(&id) {
+        used.push(id);
+        recommendations.push(make(id));
     }
 }
 
-pub(crate) fn run_search(run_opts: &RunOpts) -> Result<(), Box<dyn std::error::Error>> {
+fn recommend_variants(variants: &[VariantInfo], target_bytes: u64) -> Vec<RecommendationKind> {
+    let mut recommendations = Vec::new();
+    let mut used = Vec::new();
+
+    let best_text = variants
+        .iter()
+        .filter(|v| v.codec == CodecChoice::Mrc)
+        .filter_map(|v| setting_u8(&v.setting, "mrc-q=").map(|q| (v, q)))
+        .max_by_key(|(v, q)| (*q, v.scale_pct))
+        .map(|(v, _)| v)
+        .or_else(|| {
+            variants
+                .iter()
+                .filter(|v| v.codec == CodecChoice::Jpeg)
+                .filter_map(|v| setting_u8(&v.setting, "q=").map(|q| (v, q)))
+                .max_by_key(|(v, q)| (*q, v.scale_pct))
+                .map(|(v, _)| v)
+        });
+    if let Some(v) = best_text {
+        push_recommendation(
+            &mut recommendations,
+            &mut used,
+            v.id,
+            RecommendationKind::BestForText,
+        );
+    }
+
+    let balanced = variants
+        .iter()
+        .filter(|v| {
+            v.codec == CodecChoice::Jpeg
+                && setting_u8(&v.setting, "q=").is_some_and(|q| (60..=85).contains(&q))
+        })
+        .min_by_key(|v| {
+            (
+                distance_to_target(v.size_bytes, target_bytes),
+                Reverse(v.scale_pct),
+            )
+        })
+        .or_else(|| {
+            variants
+                .iter()
+                .filter(|v| v.codec != CodecChoice::Mrc)
+                .min_by_key(|v| {
+                    (
+                        distance_to_target(v.size_bytes, target_bytes),
+                        Reverse(v.scale_pct),
+                    )
+                })
+        });
+    if let Some(v) = balanced {
+        push_recommendation(
+            &mut recommendations,
+            &mut used,
+            v.id,
+            RecommendationKind::Balanced,
+        );
+    }
+
+    if let Some(v) = variants
+        .iter()
+        .max_by_key(|v| (v.scale_pct, Reverse(v.size_bytes)))
+    {
+        push_recommendation(
+            &mut recommendations,
+            &mut used,
+            v.id,
+            RecommendationKind::MaxDetail,
+        );
+    }
+
+    if let Some(v) = variants.iter().min_by_key(|v| v.size_bytes) {
+        push_recommendation(
+            &mut recommendations,
+            &mut used,
+            v.id,
+            RecommendationKind::Smallest,
+        );
+    }
+
+    recommendations
+}
+
+pub(crate) fn run_search(
+    run_opts: &RunOpts,
+    reporter: &dyn ProgressReporter,
+    cancel: &CancellationToken,
+) -> Result<SearchSummary, Box<dyn std::error::Error>> {
+    let target_bytes = (run_opts.target_mb * 1024.0 * 1024.0) as u64;
+
+    match run_search_inner(run_opts, reporter, cancel) {
+        Ok(mut summary) => {
+            let recommendations = recommend_variants(&summary.variants, target_bytes);
+            reporter.report(ProgressEvent::Recommendations(recommendations.clone()));
+            reporter.report(ProgressEvent::Finished {
+                status: FinishStatus::Success,
+            });
+            summary.recommendations = recommendations;
+            Ok(summary)
+        }
+        Err(err) => {
+            if err.as_ref().downcast_ref::<Cancelled>().is_some() {
+                reporter.report(ProgressEvent::Finished {
+                    status: FinishStatus::Cancelled,
+                });
+            } else {
+                let message = err.to_string();
+                reporter.report(ProgressEvent::Log {
+                    level: LogLevel::Error,
+                    message: message.clone(),
+                });
+                reporter.report(ProgressEvent::Finished {
+                    status: FinishStatus::Failed(message),
+                });
+            }
+            Err(err)
+        }
+    }
+}
+
+fn run_search_inner(
+    run_opts: &RunOpts,
+    reporter: &dyn ProgressReporter,
+    cancel: &CancellationToken,
+) -> Result<SearchSummary, Box<dyn std::error::Error>> {
+    check_cancel(cancel)?;
+
     let target_bytes = (run_opts.target_mb * 1024.0 * 1024.0) as u64;
     let tolerance_bytes = (2.0 * 1024.0 * 1024.0) as u64;
 
     let images_dir = &run_opts.input;
 
+    reporter.report(ProgressEvent::Phase(SearchPhase::LoadingImages));
     if !images_dir.exists() {
-        eprintln!("Ошибка: папка не найдена: {}", images_dir.display());
-        std::process::exit(1);
+        return Err(Box::new(EngineMessage(format!(
+            "Ошибка: папка не найдена: {}",
+            images_dir.display()
+        ))));
     }
 
     let image_paths = collect_images(images_dir)?;
     if image_paths.is_empty() {
-        eprintln!("Ошибка: в папке нет изображений: {}", images_dir.display());
-        std::process::exit(1);
+        return Err(Box::new(EngineMessage(format!(
+            "Ошибка: в папке нет изображений: {}",
+            images_dir.display()
+        ))));
     }
 
     fs::create_dir_all(&run_opts.output)?;
 
-    println!("Найдено изображений: {}", image_paths.len());
-    println!("Целевой размер: {:.0} MB (±2 MB)", run_opts.target_mb);
+    reporter.report(ProgressEvent::ImagesFound {
+        count: image_paths.len(),
+    });
+    report_info(
+        reporter,
+        format!("Найдено изображений: {}", image_paths.len()),
+    );
+    report_info(
+        reporter,
+        format!("Целевой размер: {:.0} MB (±2 MB)", run_opts.target_mb),
+    );
     if run_opts.preproc.despeckle
         || run_opts.preproc.flatten_threshold > 0
         || run_opts.preproc.deskew
@@ -83,23 +307,24 @@ pub(crate) fn run_search(run_opts: &RunOpts) -> Result<(), Box<dyn std::error::E
         .into_iter()
         .flatten()
         .collect();
-        println!("Препроцессинг: {}", active.join(", "));
+        report_info(reporter, format!("Препроцессинг: {}", active.join(", ")));
     }
 
-    let images: Vec<(PathBuf, image::DynamicImage)> = image_paths
-        .iter()
-        .map(|p| {
-            image::open(p)
-                .map(|img| {
-                    let img = preprocess(img, &run_opts.preproc);
-                    (p.clone(), img)
-                })
-                .map_err(|e| {
-                    eprintln!("Ошибка открытия {}: {}", p.display(), e);
-                    e
-                })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    reporter.report(ProgressEvent::Phase(SearchPhase::Preprocessing));
+    let mut images: Vec<(PathBuf, image::DynamicImage)> = Vec::with_capacity(image_paths.len());
+    for (index, path) in image_paths.iter().enumerate() {
+        check_cancel(cancel)?;
+        reporter.report(ProgressEvent::CurrentPage {
+            path: path.display().to_string(),
+            index: index + 1,
+            total: image_paths.len(),
+        });
+        let img = image::open(path)
+            .map_err(|e| EngineMessage(format!("Ошибка открытия {}: {}", path.display(), e)))?;
+        check_cancel(cancel)?;
+        let img = preprocess(img, &run_opts.preproc, reporter);
+        images.push((path.clone(), img));
+    }
 
     // Passthrough embeds the original JPEG bytes, bypassing the preprocessed DynamicImage.
     // Disable it whenever any preprocessing is active so flags take effect on every variant.
@@ -113,36 +338,58 @@ pub(crate) fn run_search(run_opts: &RunOpts) -> Result<(), Box<dyn std::error::E
     let run_mrc = matches!(run_opts.codec, CodecChoice::Mrc | CodecChoice::Auto);
 
     let quality_steps: Vec<u8> = (1..=20).rev().map(|i| i * 5).collect(); // 100, 95, ..., 5
-    // (filename, setting_label, scale%, size_mb)
-    // setting_label: "q=080" for JPEG, "bpp=0.50" for JP2, "mrc-q=040" for MRC.
-    let mut variants: Vec<(String, String, u32, f64)> = Vec::new();
+    let mut variants: Vec<CreatedVariant> = Vec::new();
 
     if run_jpeg {
-        println!(
-            "\n[JPEG] Поиск вариантов: для каждого quality ищем scale, дающий ~{:.0} MB...\n",
-            run_opts.target_mb
+        reporter.report(ProgressEvent::Phase(SearchPhase::Jpeg));
+        report_info(
+            reporter,
+            format!(
+                "\n[JPEG] Поиск вариантов: для каждого quality ищем scale, дающий ~{:.0} MB...\n",
+                run_opts.target_mb
+            ),
         );
     }
 
     if run_jpeg {
-        for &q in &quality_steps {
+        for (step_index, &q) in quality_steps.iter().enumerate() {
+            check_cancel(cancel)?;
+            let setting = format!("q={:03}", q);
+            reporter.report(ProgressEvent::SettingStarted {
+                codec: CodecChoice::Jpeg,
+                setting: setting.clone(),
+                index: step_index + 1,
+                total: quality_steps.len(),
+            });
             let max_size = estimate_pdf_size(&images, q, 1.0, allow_passthrough)?;
             if max_size < target_bytes.saturating_sub(tolerance_bytes) {
-                println!(
+                let message = format!(
                     "  quality={:3}: даже при scale=100% размер {:.1} MB — меньше цели, пропуск остальных",
                     q,
                     max_size as f64 / (1024.0 * 1024.0)
                 );
+                reporter.report(ProgressEvent::SettingSkipped {
+                    codec: CodecChoice::Jpeg,
+                    setting,
+                    reason: message.clone(),
+                });
+                report_info(reporter, message);
                 break;
             }
 
             let min_size = estimate_pdf_size(&images, q, 0.05, allow_passthrough)?;
             if min_size > target_bytes + tolerance_bytes {
-                println!(
+                let message = format!(
                     "  quality={:3}: даже при scale=5% размер {:.1} MB — больше цели, пропуск",
                     q,
                     min_size as f64 / (1024.0 * 1024.0)
                 );
+                reporter.report(ProgressEvent::SettingSkipped {
+                    codec: CodecChoice::Jpeg,
+                    setting,
+                    reason: message.clone(),
+                });
+                report_info(reporter, message);
                 continue;
             }
 
@@ -151,6 +398,7 @@ pub(crate) fn run_search(run_opts: &RunOpts) -> Result<(), Box<dyn std::error::E
             let mut best: Option<(u32, Vec<u8>, f64)> = None;
 
             for _ in 0..20 {
+                check_cancel(cancel)?;
                 if hi - lo < 0.5 {
                     break;
                 }
@@ -163,6 +411,11 @@ pub(crate) fn run_search(run_opts: &RunOpts) -> Result<(), Box<dyn std::error::E
                     .collect::<Result<Vec<_>, _>>()?;
                 let pdf_bytes = build_pdf(&jpegs);
                 let size = pdf_bytes.len() as u64;
+                reporter.report(ProgressEvent::Probe {
+                    setting: setting.clone(),
+                    scale: mid as u32,
+                    size_bytes: size,
+                });
 
                 let in_range = size <= target_bytes + tolerance_bytes
                     && size >= target_bytes.saturating_sub(tolerance_bytes);
@@ -179,6 +432,7 @@ pub(crate) fn run_search(run_opts: &RunOpts) -> Result<(), Box<dyn std::error::E
             }
 
             if best.is_none() {
+                check_cancel(cancel)?;
                 let mid = ((lo + hi) / 2.0).round().clamp(5.0, 100.0);
                 let s = mid / 100.0;
                 let jpegs: Vec<Frame> = images
@@ -196,15 +450,36 @@ pub(crate) fn run_search(run_opts: &RunOpts) -> Result<(), Box<dyn std::error::E
             }
 
             if let Some((s_pct, pdf_bytes, size_mb)) = best {
-                let filename = format!("variant_q{:03}_s{:03}.pdf", q, s_pct);
-                let filename = write_variant(&run_opts.output, &filename, &pdf_bytes)?;
-                println!(
-                    "  quality={:3}, scale={:3}% -> {} ({:.1} MB)",
-                    q, s_pct, filename, size_mb
+                let raw_filename = format!("variant_q{:03}_s{:03}.pdf", q, s_pct);
+                let (filename, display_filename) =
+                    write_variant(&run_opts.output, &raw_filename, &pdf_bytes)?;
+                report_info(
+                    reporter,
+                    format!(
+                        "  quality={:3}, scale={:3}% -> {} ({:.1} MB)",
+                        q, s_pct, display_filename, size_mb
+                    ),
                 );
-                variants.push((filename, format!("q={:03}", q), s_pct, size_mb));
+                record_variant(
+                    &mut variants,
+                    reporter,
+                    VariantRecord {
+                        filename,
+                        display_filename,
+                        codec: CodecChoice::Jpeg,
+                        setting: format!("q={:03}", q),
+                        scale_pct: s_pct,
+                        size_bytes: pdf_bytes.len() as u64,
+                    },
+                );
             } else {
-                println!("  quality={:3}: не удалось попасть в целевой диапазон", q);
+                let message = format!("  quality={:3}: не удалось попасть в целевой диапазон", q);
+                reporter.report(ProgressEvent::SettingSkipped {
+                    codec: CodecChoice::Jpeg,
+                    setting,
+                    reason: message.clone(),
+                });
+                report_info(reporter, message);
             }
         }
     } // end if run_jpeg / for quality_steps
@@ -215,29 +490,54 @@ pub(crate) fn run_search(run_opts: &RunOpts) -> Result<(), Box<dyn std::error::E
     let jp2_steps: &[u32] = &[200, 150, 100, 75, 50, 35, 25, 18, 10, 5];
 
     if run_jp2 {
-        println!(
-            "\n[JP2] Поиск вариантов: для каждого bpp ищем scale, дающий ~{:.0} MB...\n",
-            run_opts.target_mb
+        check_cancel(cancel)?;
+        reporter.report(ProgressEvent::Phase(SearchPhase::Jp2));
+        report_info(
+            reporter,
+            format!(
+                "\n[JP2] Поиск вариантов: для каждого bpp ищем scale, дающий ~{:.0} MB...\n",
+                run_opts.target_mb
+            ),
         );
-        for &bpp_x100 in jp2_steps {
+        for (step_index, &bpp_x100) in jp2_steps.iter().enumerate() {
+            check_cancel(cancel)?;
             let bpp = bpp_x100 as f32 / 100.0;
+            let setting = format!("bpp={:.2}", bpp);
+            reporter.report(ProgressEvent::SettingStarted {
+                codec: CodecChoice::Jp2,
+                setting: setting.clone(),
+                index: step_index + 1,
+                total: jp2_steps.len(),
+            });
 
             let max_size = estimate_jp2_size(&images, bpp, 1.0)?;
             if max_size < target_bytes.saturating_sub(tolerance_bytes) {
-                println!(
+                let message = format!(
                     "  bpp={:.2}: даже при scale=100% размер {:.1} MB — меньше цели, пропуск остальных",
                     bpp,
                     max_size as f64 / (1024.0 * 1024.0)
                 );
+                reporter.report(ProgressEvent::SettingSkipped {
+                    codec: CodecChoice::Jp2,
+                    setting,
+                    reason: message.clone(),
+                });
+                report_info(reporter, message);
                 break;
             }
             let min_size = estimate_jp2_size(&images, bpp, 0.05)?;
             if min_size > target_bytes + tolerance_bytes {
-                println!(
+                let message = format!(
                     "  bpp={:.2}: даже при scale=5% размер {:.1} MB — больше цели, пропуск",
                     bpp,
                     min_size as f64 / (1024.0 * 1024.0)
                 );
+                reporter.report(ProgressEvent::SettingSkipped {
+                    codec: CodecChoice::Jp2,
+                    setting,
+                    reason: message.clone(),
+                });
+                report_info(reporter, message);
                 continue;
             }
 
@@ -246,6 +546,7 @@ pub(crate) fn run_search(run_opts: &RunOpts) -> Result<(), Box<dyn std::error::E
             let mut best: Option<(u32, Vec<u8>, f64)> = None;
 
             for _ in 0..20 {
+                check_cancel(cancel)?;
                 if hi - lo < 0.5 {
                     break;
                 }
@@ -258,6 +559,11 @@ pub(crate) fn run_search(run_opts: &RunOpts) -> Result<(), Box<dyn std::error::E
                     .collect::<Result<Vec<_>, _>>()?;
                 let pdf_bytes = build_pdf(&frames);
                 let size = pdf_bytes.len() as u64;
+                reporter.report(ProgressEvent::Probe {
+                    setting: setting.clone(),
+                    scale: mid as u32,
+                    size_bytes: size,
+                });
 
                 let in_range = size <= target_bytes + tolerance_bytes
                     && size >= target_bytes.saturating_sub(tolerance_bytes);
@@ -273,6 +579,7 @@ pub(crate) fn run_search(run_opts: &RunOpts) -> Result<(), Box<dyn std::error::E
             }
 
             if best.is_none() {
+                check_cancel(cancel)?;
                 let mid = ((lo + hi) / 2.0).round().clamp(5.0, 100.0);
                 let s = mid / 100.0;
                 let frames: Vec<Frame> = images
@@ -289,15 +596,36 @@ pub(crate) fn run_search(run_opts: &RunOpts) -> Result<(), Box<dyn std::error::E
             }
 
             if let Some((s_pct, pdf_bytes, size_mb)) = best {
-                let filename = format!("variant_jp2_b{:03}_s{:03}.pdf", bpp_x100, s_pct);
-                let filename = write_variant(&run_opts.output, &filename, &pdf_bytes)?;
-                println!(
-                    "  bpp={:.2}, scale={:3}% -> {} ({:.1} MB)",
-                    bpp, s_pct, filename, size_mb
+                let raw_filename = format!("variant_jp2_b{:03}_s{:03}.pdf", bpp_x100, s_pct);
+                let (filename, display_filename) =
+                    write_variant(&run_opts.output, &raw_filename, &pdf_bytes)?;
+                report_info(
+                    reporter,
+                    format!(
+                        "  bpp={:.2}, scale={:3}% -> {} ({:.1} MB)",
+                        bpp, s_pct, display_filename, size_mb
+                    ),
                 );
-                variants.push((filename, format!("bpp={:.2}", bpp), s_pct, size_mb));
+                record_variant(
+                    &mut variants,
+                    reporter,
+                    VariantRecord {
+                        filename,
+                        display_filename,
+                        codec: CodecChoice::Jp2,
+                        setting: format!("bpp={:.2}", bpp),
+                        scale_pct: s_pct,
+                        size_bytes: pdf_bytes.len() as u64,
+                    },
+                );
             } else {
-                println!("  bpp={:.2}: не удалось попасть в целевой диапазон", bpp);
+                let message = format!("  bpp={:.2}: не удалось попасть в целевой диапазон", bpp);
+                reporter.report(ProgressEvent::SettingSkipped {
+                    codec: CodecChoice::Jp2,
+                    setting,
+                    reason: message.clone(),
+                });
+                report_info(reporter, message);
             }
         }
     }
@@ -306,31 +634,56 @@ pub(crate) fn run_search(run_opts: &RunOpts) -> Result<(), Box<dyn std::error::E
     let mrc_quality_steps: &[u8] = &[55, 45, 35, 25];
 
     if run_mrc {
-        println!(
-            "\n[MRC] Поиск вариантов: маска текста CCITT G4 + JPEG-фон около {:.0} MB...\n",
-            run_opts.target_mb
+        check_cancel(cancel)?;
+        reporter.report(ProgressEvent::Phase(SearchPhase::Mrc));
+        report_info(
+            reporter,
+            format!(
+                "\n[MRC] Поиск вариантов: маска текста CCITT G4 + JPEG-фон около {:.0} MB...\n",
+                run_opts.target_mb
+            ),
         );
 
-        let mrc_sources = prepare_mrc_sources(&images)?;
+        let mrc_sources = prepare_mrc_sources(&images, reporter, cancel)?;
         if let Some(mrc_sources) = mrc_sources {
-            for &q in mrc_quality_steps {
+            for (step_index, &q) in mrc_quality_steps.iter().enumerate() {
+                check_cancel(cancel)?;
+                let setting = format!("mrc-q={:03}", q);
+                reporter.report(ProgressEvent::SettingStarted {
+                    codec: CodecChoice::Mrc,
+                    setting: setting.clone(),
+                    index: step_index + 1,
+                    total: mrc_quality_steps.len(),
+                });
                 let max_size = estimate_mrc_size(&mrc_sources, q, 1.0)?;
                 if max_size < target_bytes.saturating_sub(tolerance_bytes) {
-                    println!(
+                    let message = format!(
                         "  bg-q={:3}: даже при bg-scale=100% размер {:.1} MB — меньше цели, пропуск остальных",
                         q,
                         max_size as f64 / (1024.0 * 1024.0)
                     );
+                    reporter.report(ProgressEvent::SettingSkipped {
+                        codec: CodecChoice::Mrc,
+                        setting,
+                        reason: message.clone(),
+                    });
+                    report_info(reporter, message);
                     break;
                 }
 
                 let min_size = estimate_mrc_size(&mrc_sources, q, 0.05)?;
                 if min_size > target_bytes + tolerance_bytes {
-                    println!(
+                    let message = format!(
                         "  bg-q={:3}: даже при bg-scale=5% размер {:.1} MB — больше цели, пропуск",
                         q,
                         min_size as f64 / (1024.0 * 1024.0)
                     );
+                    reporter.report(ProgressEvent::SettingSkipped {
+                        codec: CodecChoice::Mrc,
+                        setting,
+                        reason: message.clone(),
+                    });
+                    report_info(reporter, message);
                     continue;
                 }
 
@@ -339,6 +692,7 @@ pub(crate) fn run_search(run_opts: &RunOpts) -> Result<(), Box<dyn std::error::E
                 let mut best: Option<(u32, Vec<u8>, f64)> = None;
 
                 for _ in 0..20 {
+                    check_cancel(cancel)?;
                     if hi - lo < 0.5 {
                         break;
                     }
@@ -348,6 +702,11 @@ pub(crate) fn run_search(run_opts: &RunOpts) -> Result<(), Box<dyn std::error::E
                     let frames = encode_mrc_frames(&mrc_sources, q, s)?;
                     let pdf_bytes = build_mrc_pdf(&frames);
                     let size = pdf_bytes.len() as u64;
+                    reporter.report(ProgressEvent::Probe {
+                        setting: setting.clone(),
+                        scale: mid as u32,
+                        size_bytes: size,
+                    });
 
                     let in_range = size <= target_bytes + tolerance_bytes
                         && size >= target_bytes.saturating_sub(tolerance_bytes);
@@ -363,6 +722,7 @@ pub(crate) fn run_search(run_opts: &RunOpts) -> Result<(), Box<dyn std::error::E
                 }
 
                 if best.is_none() {
+                    check_cancel(cancel)?;
                     let mid = ((lo + hi) / 2.0).round().clamp(5.0, 100.0);
                     let s = mid / 100.0;
                     let frames = encode_mrc_frames(&mrc_sources, q, s)?;
@@ -376,33 +736,64 @@ pub(crate) fn run_search(run_opts: &RunOpts) -> Result<(), Box<dyn std::error::E
                 }
 
                 if let Some((s_pct, pdf_bytes, size_mb)) = best {
-                    let filename = format!("variant_mrc_q{:03}_s{:03}.pdf", q, s_pct);
-                    let filename = write_variant(&run_opts.output, &filename, &pdf_bytes)?;
-                    println!(
-                        "  bg-q={:3}, bg-scale={:3}% -> {} ({:.1} MB)",
-                        q, s_pct, filename, size_mb
+                    let raw_filename = format!("variant_mrc_q{:03}_s{:03}.pdf", q, s_pct);
+                    let (filename, display_filename) =
+                        write_variant(&run_opts.output, &raw_filename, &pdf_bytes)?;
+                    report_info(
+                        reporter,
+                        format!(
+                            "  bg-q={:3}, bg-scale={:3}% -> {} ({:.1} MB)",
+                            q, s_pct, display_filename, size_mb
+                        ),
                     );
-                    variants.push((filename, format!("mrc-q={:03}", q), s_pct, size_mb));
+                    record_variant(
+                        &mut variants,
+                        reporter,
+                        VariantRecord {
+                            filename,
+                            display_filename,
+                            codec: CodecChoice::Mrc,
+                            setting: format!("mrc-q={:03}", q),
+                            scale_pct: s_pct,
+                            size_bytes: pdf_bytes.len() as u64,
+                        },
+                    );
                 } else {
-                    println!("  bg-q={:3}: не удалось попасть в целевой диапазон", q);
+                    let message = format!("  bg-q={:3}: не удалось попасть в целевой диапазон", q);
+                    reporter.report(ProgressEvent::SettingSkipped {
+                        codec: CodecChoice::Mrc,
+                        setting,
+                        reason: message.clone(),
+                    });
+                    report_info(reporter, message);
                 }
             }
         } else {
-            println!("  MRC пропущен: маска текста слишком мала/велика хотя бы на одной странице");
+            let message =
+                "  MRC пропущен: маска текста слишком мала/велика хотя бы на одной странице";
+            report_info(reporter, message);
         }
     }
 
-    println!("\n--- Итого ---");
+    report_info(reporter, "\n--- Итого ---");
     if variants.is_empty() {
-        println!("Не удалось создать ни одного варианта в целевом диапазоне.");
-    } else {
-        println!("Создано вариантов: {}\n", variants.len());
-        println!(
-            "  {:>12}  {:>5}  {:>10}  файл",
-            "параметр", "scale", "размер"
+        report_info(
+            reporter,
+            "Не удалось создать ни одного варианта в целевом диапазоне.",
         );
-        println!("  {}", "-".repeat(56));
-        for (filename, setting, s, size_mb) in &variants {
+    } else {
+        report_info(reporter, format!("Создано вариантов: {}\n", variants.len()));
+        report_info(
+            reporter,
+            format!(
+                "  {:>12}  {:>5}  {:>10}  файл",
+                "параметр", "scale", "размер"
+            ),
+        );
+        report_info(reporter, format!("  {}", "-".repeat(56)));
+        for variant in &variants {
+            let setting = &variant.info.setting;
+            let s = variant.info.scale_pct;
             let hint = if let Some(q_str) = setting
                 .strip_prefix("q=")
                 .or_else(|| setting.strip_prefix("mrc-q="))
@@ -410,36 +801,72 @@ pub(crate) fn run_search(run_opts: &RunOpts) -> Result<(), Box<dyn std::error::E
                 let q: u8 = q_str.parse().unwrap_or(0);
                 if q > 80 {
                     "  <- чёткость"
-                } else if *s > 80 {
+                } else if s > 80 {
                     "  <- детали"
                 } else {
                     ""
                 }
             } else {
                 // JP2: hint only from scale
-                if *s > 80 { "  <- детали" } else { "" }
+                if s > 80 { "  <- детали" } else { "" }
             };
-            println!(
-                "  {:>12}  {:>3}%  {:>7.1} MB  {}{}",
-                setting, s, size_mb, filename, hint
+            report_info(
+                reporter,
+                format!(
+                    "  {:>12}  {:>3}%  {:>7.1} MB  {}{}",
+                    setting, s, variant.size_mb, variant.display_filename, hint
+                ),
             );
         }
-        println!("\n  JPEG q=...   : высокий q  = меньше артефактов (текст, чёткие края)");
-        println!("  JP2 bpp=...  : меньший bpp = агрессивнее сжатие, мягче артефакты");
-        println!(
-            "  MRC mrc-q=...: q — это JPEG-фон; текст идёт 1-битной маской (JBIG2 или G4 — что меньше)"
+        report_info(
+            reporter,
+            "\n  JPEG q=...   : высокий q  = меньше артефактов (текст, чёткие края)",
         );
-        println!("  Высокий scale = больше деталей и разрешение (мелкие элементы)");
+        report_info(
+            reporter,
+            "  JP2 bpp=...  : меньший bpp = агрессивнее сжатие, мягче артефакты",
+        );
+        report_info(
+            reporter,
+            "  MRC mrc-q=...: q — это JPEG-фон; текст идёт 1-битной маской (JBIG2 или G4 — что меньше)",
+        );
+        report_info(
+            reporter,
+            "  Высокий scale = больше деталей и разрешение (мелкие элементы)",
+        );
     }
 
-    Ok(())
+    let variants = variants.into_iter().map(|variant| variant.info).collect();
+    Ok(SearchSummary {
+        variants,
+        recommendations: Vec::new(),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::progress::NoopReporter;
     use image::{DynamicImage, GrayImage, Luma, Rgb, RgbImage};
     use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct RecordingReporter {
+        events: Mutex<Vec<ProgressEvent>>,
+    }
+
+    impl ProgressReporter for RecordingReporter {
+        fn report(&self, event: ProgressEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    impl RecordingReporter {
+        fn events(&self) -> Vec<ProgressEvent> {
+            self.events.lock().unwrap().clone()
+        }
+    }
 
     fn make_jpeg(w: u32, h: u32, grayscale: bool) -> Vec<u8> {
         if grayscale {
@@ -480,6 +907,128 @@ mod tests {
         });
         assert!(ok.is_some(), "G4 decoder failed");
         decoded
+    }
+
+    fn make_variant(
+        id: usize,
+        codec: CodecChoice,
+        setting: &str,
+        scale_pct: u32,
+        size_mb: u64,
+    ) -> VariantInfo {
+        VariantInfo {
+            id,
+            filename: PathBuf::from(format!("variant-{id}.pdf")),
+            codec,
+            setting: setting.to_string(),
+            scale_pct,
+            size_bytes: size_mb * 1024 * 1024,
+        }
+    }
+
+    // ---- progress / recommendations -----------------------------------
+
+    #[test]
+    fn cancellation_aborts_search() {
+        let cancel = CancellationToken::default();
+        cancel.cancel();
+        let reporter = RecordingReporter::default();
+        let opts = RunOpts {
+            input: PathBuf::from("does-not-matter"),
+            output: PathBuf::from("."),
+            target_mb: 1.0,
+            preproc: PreprocOpts {
+                despeckle: false,
+                flatten_threshold: 0,
+                deskew: false,
+            },
+            codec: CodecChoice::Jpeg,
+        };
+        let result = run_search(&opts, &reporter, &cancel);
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(err.as_ref().downcast_ref::<Cancelled>().is_some());
+        let events = reporter.events();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            ProgressEvent::Finished {
+                status: FinishStatus::Cancelled
+            }
+        ));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ProgressEvent::Recommendations(_)))
+        );
+    }
+
+    #[test]
+    fn fatal_error_emits_log_then_finished_failed() {
+        let reporter = RecordingReporter::default();
+        let opts = RunOpts {
+            input: PathBuf::from("__missing_pdf_sizer_test_input__"),
+            output: PathBuf::from("."),
+            target_mb: 1.0,
+            preproc: PreprocOpts {
+                despeckle: false,
+                flatten_threshold: 0,
+                deskew: false,
+            },
+            codec: CodecChoice::Jpeg,
+        };
+        let result = run_search(&opts, &reporter, &CancellationToken::default());
+        assert!(result.is_err());
+        let events = reporter.events();
+        assert!(matches!(
+            events.last(),
+            Some(ProgressEvent::Finished {
+                status: FinishStatus::Failed(_)
+            })
+        ));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ProgressEvent::Finished { .. }))
+                .count(),
+            1
+        );
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                ProgressEvent::Log {
+                    level: LogLevel::Error,
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn recommendations_for_jpeg_only_run() {
+        let variants = vec![
+            make_variant(0, CodecChoice::Jpeg, "q=095", 50, 22),
+            make_variant(1, CodecChoice::Jpeg, "q=080", 80, 20),
+            make_variant(2, CodecChoice::Jpeg, "q=065", 90, 19),
+            make_variant(3, CodecChoice::Jpeg, "q=040", 60, 18),
+        ];
+        let recommendations = recommend_variants(&variants, 20 * 1024 * 1024);
+        assert_eq!(
+            recommendations,
+            vec![
+                RecommendationKind::BestForText(0),
+                RecommendationKind::Balanced(1),
+                RecommendationKind::MaxDetail(2),
+                RecommendationKind::Smallest(3),
+            ]
+        );
+    }
+
+    #[test]
+    fn recommendations_dedup() {
+        let variants = vec![make_variant(0, CodecChoice::Jpeg, "q=080", 100, 20)];
+        let recommendations = recommend_variants(&variants, 20 * 1024 * 1024);
+        assert_eq!(recommendations, vec![RecommendationKind::BestForText(0)]);
     }
 
     // ---- jpeg_component_count ------------------------------------------
@@ -690,7 +1239,9 @@ mod tests {
     fn build_mrc_pdf_uses_a_supported_mask_filter() {
         let img = make_text_scan();
         let images = vec![(PathBuf::from("page.png"), img)];
-        let sources = prepare_mrc_sources(&images).unwrap().unwrap();
+        let sources = prepare_mrc_sources(&images, &NoopReporter, &CancellationToken::default())
+            .unwrap()
+            .unwrap();
         let frames = encode_mrc_frames(&sources, 35, 0.5).unwrap();
         let pdf = build_mrc_pdf(&frames);
         let text = String::from_utf8_lossy(&pdf);

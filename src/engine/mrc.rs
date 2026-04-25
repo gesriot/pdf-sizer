@@ -4,19 +4,34 @@ use super::encode::{encode_raster_as_jpeg, encode_text_mask_g4, encode_text_mask
 use super::pdf::build_mrc_pdf;
 use super::segment::{fill_masked_background, is_mrc_suitable, segment_text_mask};
 use super::types::{MaskCodec, MrcFrame, MrcSource};
+use crate::progress::{CancellationToken, Cancelled, LogLevel, ProgressEvent, ProgressReporter};
+
+fn check_cancel(cancel: &CancellationToken) -> Result<(), Box<dyn std::error::Error>> {
+    if cancel.is_cancelled() {
+        Err(Box::new(Cancelled))
+    } else {
+        Ok(())
+    }
+}
 
 pub(crate) fn prepare_mrc_sources(
     images: &[(PathBuf, image::DynamicImage)],
+    reporter: &dyn ProgressReporter,
+    cancel: &CancellationToken,
 ) -> Result<Option<Vec<MrcSource>>, Box<dyn std::error::Error>> {
     let mut sources = Vec::with_capacity(images.len());
     for (path, img) in images {
+        check_cancel(cancel)?;
         let mask = segment_text_mask(img);
         if !is_mrc_suitable(&mask) {
-            println!(
-                "  MRC: {} пропущен по покрытию маски {:.2}%",
-                path.display(),
-                mask.coverage * 100.0
-            );
+            reporter.report(ProgressEvent::Log {
+                level: LogLevel::Info,
+                message: format!(
+                    "  MRC: {} пропущен по покрытию маски {:.2}%",
+                    path.display(),
+                    mask.coverage * 100.0
+                ),
+            });
             return Ok(None);
         }
         let background = fill_masked_background(img, &mask);

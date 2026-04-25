@@ -1,5 +1,6 @@
 mod cli;
 mod engine;
+mod progress;
 
 use clap::Parser;
 
