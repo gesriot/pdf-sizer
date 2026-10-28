@@ -2,18 +2,22 @@ use std::cmp::Reverse;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+mod dpi;
 mod encode;
+mod jbig2sym;
 mod mrc;
 mod pdf;
 mod preprocess;
+mod raster;
 mod segment;
 mod types;
 
 pub(crate) use types::{CodecChoice, PreprocOpts};
 
 use encode::{collect_images, encode_as_jp2, encode_image, estimate_jp2_size, estimate_pdf_size};
+use dpi::page_dpi;
 use mrc::{encode_mrc_frames, estimate_mrc_size, prepare_mrc_sources};
-use pdf::{build_mrc_pdf, build_pdf};
+use pdf::{build_mrc_pdf, build_pdf, page_size_pt};
 use preprocess::preprocess;
 use types::Frame;
 
@@ -30,9 +34,11 @@ use encode::{
 #[cfg(test)]
 use fax::Color as FaxColor;
 #[cfg(test)]
-use segment::{fill_masked_background, is_line_like, is_mrc_suitable, segment_text_mask};
+use mrc::prepare_page;
 #[cfg(test)]
-use types::{ComponentStats, Cs, MaskCodec, MrcFrame, PdfFilter, TextMask};
+use segment::segment_page;
+#[cfg(test)]
+use types::{Cs, FgFrame, Foreground, MaskCodec, MaskLayer, MrcFrame, PdfFilter, TextMask};
 
 pub(crate) struct RunOpts {
     pub(crate) input: PathBuf,
@@ -340,6 +346,16 @@ fn run_search_inner(
         let img = preprocess(img, &run_opts.preproc, reporter);
         images.push((path.clone(), img));
     }
+    // Physical page size from the scan resolution, identical for every variant.
+    let dpis: Vec<f32> = images
+        .iter()
+        .map(|(path, img)| page_dpi(path, img.width(), img.height()))
+        .collect();
+    let page_sizes: Vec<(f32, f32)> = images
+        .iter()
+        .zip(&dpis)
+        .map(|((_, img), &dpi)| page_size_pt(img.width(), img.height(), dpi))
+        .collect();
 
     // Passthrough embeds the original JPEG bytes, bypassing the preprocessed DynamicImage.
     // Disable it whenever any preprocessing is active so flags take effect on every variant.
@@ -430,7 +446,7 @@ fn run_search_inner(
                     .iter()
                     .map(|(path, img)| encode_image(path, img, q, s, allow_passthrough))
                     .collect::<Result<Vec<_>, _>>()?;
-                let pdf_bytes = build_pdf(&jpegs);
+                let pdf_bytes = build_pdf(&jpegs, &page_sizes);
                 let size = pdf_bytes.len() as u64;
                 reporter.report(ProgressEvent::Probe {
                     setting: setting.clone(),
@@ -460,7 +476,7 @@ fn run_search_inner(
                     .iter()
                     .map(|(path, img)| encode_image(path, img, q, s, allow_passthrough))
                     .collect::<Result<Vec<_>, _>>()?;
-                let pdf_bytes = build_pdf(&jpegs);
+                let pdf_bytes = build_pdf(&jpegs, &page_sizes);
                 let size = pdf_bytes.len() as u64;
                 let in_range = size <= target_bytes + tolerance_bytes
                     && size >= target_bytes.saturating_sub(tolerance_bytes);
@@ -578,7 +594,7 @@ fn run_search_inner(
                     .iter()
                     .map(|(_, img)| encode_as_jp2(img, bpp, s))
                     .collect::<Result<Vec<_>, _>>()?;
-                let pdf_bytes = build_pdf(&frames);
+                let pdf_bytes = build_pdf(&frames, &page_sizes);
                 let size = pdf_bytes.len() as u64;
                 reporter.report(ProgressEvent::Probe {
                     setting: setting.clone(),
@@ -607,7 +623,7 @@ fn run_search_inner(
                     .iter()
                     .map(|(_, img)| encode_as_jp2(img, bpp, s))
                     .collect::<Result<Vec<_>, _>>()?;
-                let pdf_bytes = build_pdf(&frames);
+                let pdf_bytes = build_pdf(&frames, &page_sizes);
                 let size = pdf_bytes.len() as u64;
                 if size <= target_bytes + tolerance_bytes
                     && size >= target_bytes.saturating_sub(tolerance_bytes)
@@ -651,7 +667,10 @@ fn run_search_inner(
         }
     }
 
-    // ------------------------------------------------------------------ MRC-lite
+    // ------------------------------------------------------------------ MRC
+    // q is the JPEG quality of pictures (background q/2, text colour max(q/2, 25)); scale is
+    // the target resolution: pictures at scale, background at scale/2, text colour at
+    // scale/4.
     let mrc_quality_steps: &[u8] = &[55, 45, 35, 25];
 
     if run_mrc {
@@ -660,139 +679,145 @@ fn run_search_inner(
         report_info(
             reporter,
             format!(
-                "\n[MRC] Поиск вариантов: маска текста CCITT G4 + JPEG-фон около {:.0} MB...\n",
+                "\n[MRC] Поиск вариантов: маска текста (JBIG2/G4) + цвет текста + фон + иллюстрации около {:.0} MB...\n",
                 run_opts.target_mb
             ),
         );
 
-        let mrc_sources = prepare_mrc_sources(&images, reporter, cancel)?;
-        if let Some(mrc_sources) = mrc_sources {
-            for (step_index, &q) in mrc_quality_steps.iter().enumerate() {
-                check_cancel(cancel)?;
-                let setting = format!("mrc-q={:03}", q);
-                reporter.report(ProgressEvent::SettingStarted {
+        let mrc_sources = prepare_mrc_sources(&images, &dpis, reporter, cancel)?;
+        // The mask stays at the text resolution unless even the smallest variant overshoots
+        // the target; then the compact mask at half that resolution is used.
+        let lowest_q = mrc_quality_steps[mrc_quality_steps.len() - 1];
+        let mut mask_level = 0;
+        if estimate_mrc_size(&mrc_sources, lowest_q, 0.05, 0)? > target_bytes + tolerance_bytes {
+            mask_level = 1;
+            report_info(
+                reporter,
+                "  маска текста не помещается в цель — разрешение маски уменьшено вдвое",
+            );
+        }
+
+        for (step_index, &q) in mrc_quality_steps.iter().enumerate() {
+            check_cancel(cancel)?;
+            let setting = format!("mrc-q={:03}", q);
+            reporter.report(ProgressEvent::SettingStarted {
+                codec: CodecChoice::Mrc,
+                setting: setting.clone(),
+                index: step_index + 1,
+                total: mrc_quality_steps.len(),
+            });
+            let max_size = estimate_mrc_size(&mrc_sources, q, 1.0, mask_level)?;
+            if max_size < target_bytes.saturating_sub(tolerance_bytes) {
+                let message = format!(
+                    "  q={:3}: даже при scale=100% размер {:.1} MB — меньше цели, пропуск остальных",
+                    q,
+                    max_size as f64 / (1024.0 * 1024.0)
+                );
+                reporter.report(ProgressEvent::SettingSkipped {
                     codec: CodecChoice::Mrc,
-                    setting: setting.clone(),
-                    index: step_index + 1,
-                    total: mrc_quality_steps.len(),
+                    setting,
+                    reason: message.clone(),
                 });
-                let max_size = estimate_mrc_size(&mrc_sources, q, 1.0)?;
-                if max_size < target_bytes.saturating_sub(tolerance_bytes) {
-                    let message = format!(
-                        "  bg-q={:3}: даже при bg-scale=100% размер {:.1} MB — меньше цели, пропуск остальных",
-                        q,
-                        max_size as f64 / (1024.0 * 1024.0)
-                    );
-                    reporter.report(ProgressEvent::SettingSkipped {
-                        codec: CodecChoice::Mrc,
-                        setting,
-                        reason: message.clone(),
-                    });
-                    report_info(reporter, message);
+                report_info(reporter, message);
+                break;
+            }
+
+            let min_size = estimate_mrc_size(&mrc_sources, q, 0.05, mask_level)?;
+            if min_size > target_bytes + tolerance_bytes {
+                let message = format!(
+                    "  q={:3}: даже при scale=5% размер {:.1} MB — больше цели, пропуск",
+                    q,
+                    min_size as f64 / (1024.0 * 1024.0)
+                );
+                reporter.report(ProgressEvent::SettingSkipped {
+                    codec: CodecChoice::Mrc,
+                    setting,
+                    reason: message.clone(),
+                });
+                report_info(reporter, message);
+                continue;
+            }
+
+            let mut lo = 5.0_f64;
+            let mut hi = 100.0_f64;
+            let mut best: Option<(u32, Vec<u8>, f64)> = None;
+
+            for _ in 0..20 {
+                check_cancel(cancel)?;
+                if hi - lo < 0.5 {
                     break;
                 }
+                let mid = ((lo + hi) / 2.0).round().clamp(5.0, 100.0);
+                let s = mid / 100.0;
 
-                let min_size = estimate_mrc_size(&mrc_sources, q, 0.05)?;
-                if min_size > target_bytes + tolerance_bytes {
-                    let message = format!(
-                        "  bg-q={:3}: даже при bg-scale=5% размер {:.1} MB — больше цели, пропуск",
-                        q,
-                        min_size as f64 / (1024.0 * 1024.0)
-                    );
-                    reporter.report(ProgressEvent::SettingSkipped {
-                        codec: CodecChoice::Mrc,
-                        setting,
-                        reason: message.clone(),
-                    });
-                    report_info(reporter, message);
-                    continue;
-                }
+                let frames = encode_mrc_frames(&mrc_sources, q, s, mask_level)?;
+                let pdf_bytes = build_mrc_pdf(&frames);
+                let size = pdf_bytes.len() as u64;
+                reporter.report(ProgressEvent::Probe {
+                    setting: setting.clone(),
+                    scale: mid as u32,
+                    size_bytes: size,
+                });
 
-                let mut lo = 5.0_f64;
-                let mut hi = 100.0_f64;
-                let mut best: Option<(u32, Vec<u8>, f64)> = None;
+                let in_range = size <= target_bytes + tolerance_bytes
+                    && size >= target_bytes.saturating_sub(tolerance_bytes);
 
-                for _ in 0..20 {
-                    check_cancel(cancel)?;
-                    if hi - lo < 0.5 {
-                        break;
-                    }
-                    let mid = ((lo + hi) / 2.0).round().clamp(5.0, 100.0);
-                    let s = mid / 100.0;
-
-                    let frames = encode_mrc_frames(&mrc_sources, q, s)?;
-                    let pdf_bytes = build_mrc_pdf(&frames);
-                    let size = pdf_bytes.len() as u64;
-                    reporter.report(ProgressEvent::Probe {
-                        setting: setting.clone(),
-                        scale: mid as u32,
-                        size_bytes: size,
-                    });
-
-                    let in_range = size <= target_bytes + tolerance_bytes
-                        && size >= target_bytes.saturating_sub(tolerance_bytes);
-
-                    if in_range {
-                        best = Some((mid as u32, pdf_bytes, size as f64 / (1024.0 * 1024.0)));
-                        break;
-                    } else if size > target_bytes {
-                        hi = mid - 1.0;
-                    } else {
-                        lo = mid + 1.0;
-                    }
-                }
-
-                if best.is_none() {
-                    check_cancel(cancel)?;
-                    let mid = ((lo + hi) / 2.0).round().clamp(5.0, 100.0);
-                    let s = mid / 100.0;
-                    let frames = encode_mrc_frames(&mrc_sources, q, s)?;
-                    let pdf_bytes = build_mrc_pdf(&frames);
-                    let size = pdf_bytes.len() as u64;
-                    if size <= target_bytes + tolerance_bytes
-                        && size >= target_bytes.saturating_sub(tolerance_bytes)
-                    {
-                        best = Some((mid as u32, pdf_bytes, size as f64 / (1024.0 * 1024.0)));
-                    }
-                }
-
-                if let Some((s_pct, pdf_bytes, size_mb)) = best {
-                    let raw_filename = format!("variant_mrc_q{:03}_s{:03}.pdf", q, s_pct);
-                    let (filename, display_filename) =
-                        write_variant(&run_opts.output, &raw_filename, &pdf_bytes)?;
-                    report_info(
-                        reporter,
-                        format!(
-                            "  bg-q={:3}, bg-scale={:3}% -> {} ({:.1} MB)",
-                            q, s_pct, display_filename, size_mb
-                        ),
-                    );
-                    record_variant(
-                        &mut variants,
-                        reporter,
-                        VariantRecord {
-                            filename,
-                            display_filename,
-                            codec: CodecChoice::Mrc,
-                            setting: format!("mrc-q={:03}", q),
-                            scale_pct: s_pct,
-                            size_bytes: pdf_bytes.len() as u64,
-                        },
-                    );
+                if in_range {
+                    best = Some((mid as u32, pdf_bytes, size as f64 / (1024.0 * 1024.0)));
+                    break;
+                } else if size > target_bytes {
+                    hi = mid - 1.0;
                 } else {
-                    let message = format!("  bg-q={:3}: не удалось попасть в целевой диапазон", q);
-                    reporter.report(ProgressEvent::SettingSkipped {
-                        codec: CodecChoice::Mrc,
-                        setting,
-                        reason: message.clone(),
-                    });
-                    report_info(reporter, message);
+                    lo = mid + 1.0;
                 }
             }
-        } else {
-            let message =
-                "  MRC пропущен: маска текста слишком мала/велика хотя бы на одной странице";
-            report_info(reporter, message);
+
+            if best.is_none() {
+                check_cancel(cancel)?;
+                let mid = ((lo + hi) / 2.0).round().clamp(5.0, 100.0);
+                let s = mid / 100.0;
+                let frames = encode_mrc_frames(&mrc_sources, q, s, mask_level)?;
+                let pdf_bytes = build_mrc_pdf(&frames);
+                let size = pdf_bytes.len() as u64;
+                if size <= target_bytes + tolerance_bytes
+                    && size >= target_bytes.saturating_sub(tolerance_bytes)
+                {
+                    best = Some((mid as u32, pdf_bytes, size as f64 / (1024.0 * 1024.0)));
+                }
+            }
+
+            if let Some((s_pct, pdf_bytes, size_mb)) = best {
+                let raw_filename = format!("variant_mrc_q{:03}_s{:03}.pdf", q, s_pct);
+                let (filename, display_filename) =
+                    write_variant(&run_opts.output, &raw_filename, &pdf_bytes)?;
+                report_info(
+                    reporter,
+                    format!(
+                        "  q={:3}, scale={:3}% -> {} ({:.1} MB)",
+                        q, s_pct, display_filename, size_mb
+                    ),
+                );
+                record_variant(
+                    &mut variants,
+                    reporter,
+                    VariantRecord {
+                        filename,
+                        display_filename,
+                        codec: CodecChoice::Mrc,
+                        setting: format!("mrc-q={:03}", q),
+                        scale_pct: s_pct,
+                        size_bytes: pdf_bytes.len() as u64,
+                    },
+                );
+            } else {
+                let message = format!("  q={:3}: не удалось попасть в целевой диапазон", q);
+                reporter.report(ProgressEvent::SettingSkipped {
+                    codec: CodecChoice::Mrc,
+                    setting,
+                    reason: message.clone(),
+                });
+                report_info(reporter, message);
+            }
         }
     }
 
@@ -849,7 +874,7 @@ fn run_search_inner(
         );
         report_info(
             reporter,
-            "  MRC mrc-q=...: q — это JPEG-фон; текст идёт 1-битной маской (JBIG2 или G4 — что меньше)",
+            "  MRC mrc-q=...: q — JPEG иллюстраций (фон сжимается сильнее); текст — 1-битная маска (JBIG2 со словарём символов или G4)",
         );
         report_info(
             reporter,
@@ -1184,19 +1209,15 @@ mod tests {
         );
     }
 
-    // ---- MRC-lite ------------------------------------------------------
+    // ---- MRC -----------------------------------------------------------
 
     #[test]
     fn mrc_segmentation_detects_text_like_components() {
         let img = make_text_scan();
-        let mask = segment_text_mask(&img);
-        assert!(
-            is_mrc_suitable(&mask),
-            "unexpected coverage: {:.2}%",
-            mask.coverage * 100.0
-        );
-        assert!(mask.pixels[(22 * mask.width + 18) as usize]);
-        assert!(!mask.pixels[0]);
+        let seg = segment_page(&img, 300.0);
+        assert!(seg.ink[22 * 120 + 18]);
+        assert!(!seg.ink[0]);
+        assert!(seg.pictures.is_empty());
     }
 
     #[test]
@@ -1209,12 +1230,9 @@ mod tests {
                 pixels[(y * width + x) as usize] = y % 2 == 0;
             }
         }
-        let coverage = pixels.iter().filter(|&&p| p).count() as f32 / (width * height) as f32;
         let mask = TextMask {
             width,
             height,
-            coverage,
-            line_ratio: 0.0,
             pixels,
         };
         let encoded = encode_text_mask_g4(&mask).unwrap();
@@ -1224,11 +1242,100 @@ mod tests {
 
     #[test]
     fn mrc_background_fills_masked_text_pixels() {
-        let img = make_text_scan();
-        let mask = segment_text_mask(&img);
-        let bg = fill_masked_background(&img, &mask).to_rgb8();
-        let [r, g, b] = bg.get_pixel(18, 22).0;
-        assert!(r > 200 && g > 200 && b > 200, "text pixel was not filled");
+        let source = prepare_page(&make_text_scan(), 300.0).unwrap();
+        // The background is stored at half resolution: (18, 22) -> (9, 11).
+        let bg = source.background.to_rgb8();
+        let [r, g, b] = bg.get_pixel(9, 11).0;
+        assert!(r > 200 && g > 200 && b > 200, "text pixel was not filled: {r},{g},{b}");
+    }
+
+    #[test]
+    fn mrc_black_text_uses_a_fill_colour() {
+        let source = prepare_page(&make_text_scan(), 300.0).unwrap();
+        match source.foreground {
+            Foreground::Solid(c) => assert!(c.iter().all(|&v| v < 60), "{c:?}"),
+            Foreground::Image(_) => panic!("uniform black text should not need a colour field"),
+        }
+    }
+
+    #[test]
+    fn mrc_coloured_text_gets_a_colour_field() {
+        let mut img = RgbImage::from_fn(200, 120, |_, _| Rgb([245u8, 244, 238]));
+        for (i, colour) in [[200u8, 20, 20], [20, 20, 200], [20, 20, 20]].into_iter().enumerate() {
+            for y in 20..40 {
+                for x in 20 + i as u32 * 60..44 + i as u32 * 60 {
+                    img.put_pixel(x, y, Rgb(colour));
+                }
+            }
+        }
+        let source = prepare_page(&DynamicImage::ImageRgb8(img), 300.0).unwrap();
+        let Foreground::Image(field) = source.foreground else {
+            panic!("three text colours need a colour field");
+        };
+        // Colour field at 1/4 resolution: the red glyph (x 20..44) sits around (8, 7).
+        let p = field.to_rgb8().get_pixel(8, 7).0;
+        assert!(p[0] > 120 && p[2] < 100, "red glyph colour lost: {p:?}");
+    }
+
+    #[test]
+    fn mrc_keeps_large_heading_glyphs_and_table_rules() {
+        // The old segmentation dropped glyphs over 3× the median height and long rules.
+        let (w, h) = (600u32, 400u32);
+        let mut img = RgbImage::from_fn(w, h, |_, _| Rgb([245u8, 245, 240]));
+        for i in 0..15 {
+            let x0 = 20 + (i % 5) * 40;
+            let y0 = 20 + (i / 5) * 30;
+            for y in y0..y0 + 10 {
+                for x in x0..x0 + 8 {
+                    img.put_pixel(x, y, Rgb([15u8, 15, 15]));
+                }
+            }
+        }
+        for y in 150..240 {
+            for x in 300..350 {
+                img.put_pixel(x, y, Rgb([120u8, 20, 20]));
+            }
+        }
+        for x in 50..550 {
+            img.put_pixel(x, 300, Rgb([20u8, 20, 20]));
+            img.put_pixel(x, 301, Rgb([20u8, 20, 20]));
+        }
+        let seg = segment_page(&DynamicImage::ImageRgb8(img), 300.0);
+        assert!(seg.ink[(24 * w + 24) as usize], "body glyph");
+        assert!(seg.ink[(195 * w + 325) as usize], "heading glyph");
+        assert!(seg.ink[(300 * w + 300) as usize], "table rule");
+    }
+
+    #[test]
+    fn mrc_cuts_out_photos_but_not_flat_boxes() {
+        let (w, h) = (1200u32, 1600u32);
+        let mut seed = 12345u32;
+        let mut img = RgbImage::from_fn(w, h, |_, _| Rgb([240u8, 236, 225]));
+        for y in 100..400 {
+            for x in 100..500 {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                let n = (seed >> 24) as i32 % 30;
+                let r = (40 + (x - 100) / 2) as i32 + n;
+                let g = (200 - (y - 100) / 3) as i32 + n;
+                img.put_pixel(x, y, Rgb([r.clamp(0, 255) as u8, g.clamp(0, 255) as u8, 90]));
+            }
+        }
+        for y in 800..1000 {
+            for x in 100..700 {
+                img.put_pixel(x, y, Rgb([250u8, 236, 160]));
+            }
+        }
+        for y in 880..900 {
+            for x in 200..212 {
+                img.put_pixel(x, y, Rgb([20u8, 20, 10]));
+            }
+        }
+        let seg = segment_page(&DynamicImage::ImageRgb8(img), 300.0);
+        assert_eq!(seg.pictures.len(), 1, "{:?}", seg.pictures);
+        let p = seg.pictures[0];
+        let near = |a: u32, b: u32| a.abs_diff(b) <= 8;
+        assert!(near(p.x, 100) && near(p.y, 100) && near(p.w, 400) && near(p.h, 300), "{p:?}");
+        assert!(seg.ink[(890 * w + 205) as usize], "text inside the tinted box stays in the mask");
     }
 
     /// Build a wide A4-sized synthetic mask with hundreds of glyph-like blocks. JBIG2
@@ -1236,7 +1343,6 @@ mod tests {
     fn make_large_text_mask() -> TextMask {
         let (w, h) = (1240u32, 1754u32);
         let mut pixels = vec![false; (w * h) as usize];
-        let mut text_pixels = 0usize;
         for line in 0..40 {
             let y0 = 60 + line * 40;
             for col in 0..50 {
@@ -1244,7 +1350,6 @@ mod tests {
                 for y in y0..(y0 + 12).min(h) {
                     for x in x0..(x0 + 8).min(w) {
                         pixels[(y * w + x) as usize] = true;
-                        text_pixels += 1;
                     }
                 }
             }
@@ -1252,8 +1357,6 @@ mod tests {
         TextMask {
             width: w,
             height: h,
-            coverage: text_pixels as f32 / (w as f32 * h as f32),
-            line_ratio: 0.0,
             pixels,
         }
     }
@@ -1262,10 +1365,10 @@ mod tests {
     fn build_mrc_pdf_uses_a_supported_mask_filter() {
         let img = make_text_scan();
         let images = vec![(PathBuf::from("page.png"), img)];
-        let sources = prepare_mrc_sources(&images, &NoopReporter, &CancellationToken::default())
-            .unwrap()
-            .unwrap();
-        let frames = encode_mrc_frames(&sources, 35, 0.5).unwrap();
+        let sources =
+            prepare_mrc_sources(&images, &[300.0], &NoopReporter, &CancellationToken::default())
+                .unwrap();
+        let frames = encode_mrc_frames(&sources, 35, 0.5, 0).unwrap();
         let pdf = build_mrc_pdf(&frames);
         let text = String::from_utf8_lossy(&pdf);
         assert!(text.contains("DCTDecode"));
@@ -1275,6 +1378,23 @@ mod tests {
             text.contains("CCITTFaxDecode") || text.contains("JBIG2Decode"),
             "expected a 1-bit mask filter, found neither"
         );
+        // Both filters deliver text pixels as 0; an inverting Decode array would paint
+        // everything except the text.
+        assert!(!text.contains("/Decode ["), "mask must use the default Decode array");
+    }
+
+    #[test]
+    fn mrc_page_size_follows_dpi() {
+        let images = vec![(PathBuf::from("page.png"), make_text_scan())];
+        let sources =
+            prepare_mrc_sources(&images, &[150.0], &NoopReporter, &CancellationToken::default())
+                .unwrap();
+        let frames = encode_mrc_frames(&sources, 35, 1.0, 0).unwrap();
+        // 120×80 px at 150 dpi = 57.6×38.4 pt.
+        assert!((frames[0].page_size.0 - 57.6).abs() < 1e-3);
+        assert!((frames[0].page_size.1 - 38.4).abs() < 1e-3);
+        let (w, h) = page_size_pt(2480, 3508, 300.0);
+        assert!((w - 595.2).abs() < 0.01 && (h - 841.92).abs() < 0.01);
     }
 
     // ---- JBIG2 ---------------------------------------------------------
@@ -1287,6 +1407,25 @@ mod tests {
         let mask = make_large_text_mask();
         let bytes = encode_text_mask_jbig2(&mask).unwrap();
         assert!(!bytes.is_empty(), "JBIG2 produced an empty stream");
+    }
+
+    #[test]
+    fn jbig2_stream_has_no_end_segments() {
+        let mask = make_large_text_mask();
+        let raw = jbig2enc_rust::encode_single_image_lossless(
+            &mask_to_jbig2_pixels(&mask),
+            mask.width,
+            mask.height,
+            true,
+        )
+        .unwrap()
+        .page_data;
+        // The encoder appends 11-byte end-of-page (49) and end-of-file (51) segments.
+        assert_eq!(raw[raw.len() - 18] & 0x3F, 49);
+        assert_eq!(raw[raw.len() - 7] & 0x3F, 51);
+        let stripped = encode_text_mask_jbig2(&mask).unwrap();
+        assert_eq!(raw.len() - stripped.len(), 22);
+        assert_eq!(&raw[..stripped.len()], &stripped[..]);
     }
 
     #[test]
@@ -1304,24 +1443,31 @@ mod tests {
 
     #[test]
     fn build_mrc_pdf_emits_jbig2_filter_when_jbig2_wins() {
-        // Prepare an MrcSource that explicitly uses JBIG2, bypassing auto-selection,
-        // so the PDF path that emits /JBIG2Decode is exercised even if a future mask
-        // happens to be smaller in G4.
+        // Build a frame that explicitly uses JBIG2, bypassing auto-selection, so the PDF
+        // path that emits /JBIG2Decode is exercised even if a future mask happens to be
+        // smaller in G4.
         let mask = make_large_text_mask();
-        let bytes = encode_text_mask_jbig2(&mask).unwrap();
+        let layer = MaskLayer {
+            width: mask.width,
+            height: mask.height,
+            data: encode_text_mask_jbig2(&mask).unwrap(),
+            codec: MaskCodec::Jbig2,
+            globals: None,
+        };
         let bg = DynamicImage::ImageRgb8(RgbImage::from_fn(40, 40, |_, _| Rgb([240u8, 240, 240])));
-        let bg_frame = encode_raster_as_jpeg(&bg, 50, 1.0).unwrap();
         let frame = MrcFrame {
-            background: bg_frame,
-            mask_data: bytes,
-            mask_codec: MaskCodec::Jbig2,
-            mask_w: mask.width,
-            mask_h: mask.height,
+            page_size: (595.2, 841.92),
+            source_size: (mask.width, mask.height),
+            background: encode_raster_as_jpeg(&bg, 50, 1.0).unwrap(),
+            mask: Some(&layer),
+            foreground: FgFrame::Solid([0, 0, 0]),
+            pictures: Vec::new(),
         };
         let pdf = build_mrc_pdf(&[frame]);
         let text = String::from_utf8_lossy(&pdf);
         assert!(text.contains("JBIG2Decode"));
         assert!(text.contains("ImageMask true"));
+        assert!(text.contains("/MediaBox [0 0 595.2 841.92]"));
         // No DecodeParms /K for JBIG2: that's CCITT-only.
         assert!(!text.contains("/K -1"));
     }
@@ -1364,111 +1510,19 @@ mod tests {
         }
     }
 
-    // ---- MRC defensive layers ------------------------------------------
-
-    #[test]
-    fn is_line_like_flags_long_thin_components() {
-        // Horizontal rule: 1 px tall, 300 px wide on an 800×600 page (> 15% of 800).
-        let mut h_rule = ComponentStats::new(100, 50);
-        for x in 100..400 {
-            h_rule.add(x, 50);
-        }
-        assert!(is_line_like(h_rule, 800, 600));
-
-        // Vertical rule: 1 px wide, 200 px tall on an 800×600 page (> 15% of 600).
-        let mut v_rule = ComponentStats::new(400, 50);
-        for y in 50..250 {
-            v_rule.add(400, y);
-        }
-        assert!(is_line_like(v_rule, 800, 600));
-
-        // A small glyph-like blob must not be flagged.
-        let mut glyph = ComponentStats::new(10, 10);
-        for x in 10..18 {
-            for y in 10..24 {
-                glyph.add(x, y);
-            }
-        }
-        assert!(!is_line_like(glyph, 800, 600));
-    }
-
-    /// Page dominated by isolated horizontal section rules — each one survives as its
-    /// own connected component, lifting line_ratio over the 0.30 gate.
-    fn make_table_scan() -> DynamicImage {
-        let (w, h) = (400u32, 400u32);
-        let mut img = RgbImage::from_fn(w, h, |_, _| Rgb([245u8, 245, 245]));
-        for row in [50u32, 110, 170, 230, 290, 350] {
-            for x in 20..380 {
-                img.put_pixel(x, row, Rgb([10u8, 10, 10]));
-                img.put_pixel(x, row + 1, Rgb([10u8, 10, 10]));
-            }
-        }
-        // Two glyph-sized blobs, fewer than the rules so line_ratio dominates.
-        for &(cy, cx) in &[(80u32, 50u32), (200u32, 100u32)] {
-            for y in cy..cy + 8 {
-                for x in cx..cx + 8 {
-                    img.put_pixel(x, y, Rgb([10u8, 10, 10]));
-                }
-            }
-        }
-        DynamicImage::ImageRgb8(img)
-    }
-
-    #[test]
-    fn mrc_rejects_table_heavy_page_via_line_ratio() {
-        let img = make_table_scan();
-        let mask = segment_text_mask(&img);
-        assert!(
-            mask.line_ratio > 0.30,
-            "expected high line_ratio, got {:.3}",
-            mask.line_ratio
-        );
-        assert!(
-            !is_mrc_suitable(&mask),
-            "MRC should skip a page dominated by table rules"
-        );
-    }
-
-    #[test]
-    fn mrc_median_filter_drops_oversized_outliers() {
-        // 15 body-sized glyphs + 1 giant block that should be pruned by the median filter.
-        let (w, h) = (400u32, 200u32);
-        let mut img = RgbImage::from_fn(w, h, |_, _| Rgb([245u8, 245, 245]));
-        for i in 0..15 {
-            let x0 = 20 + (i % 5) * 40;
-            let y0 = 20 + (i / 5) * 30;
-            for y in y0..y0 + 10 {
-                for x in x0..x0 + 8 {
-                    img.put_pixel(x, y, Rgb([10u8, 10, 10]));
-                }
-            }
-        }
-        // Oversized block: 120×80 — far outside [0.35×, 3.0×] of the ~10-px glyph median.
-        for y in 110..190 {
-            for x in 220..340 {
-                img.put_pixel(x, y, Rgb([10u8, 10, 10]));
-            }
-        }
-        let mask = segment_text_mask(&DynamicImage::ImageRgb8(img));
-        // A glyph pixel at (24, 24) should still be in the mask.
-        assert!(mask.pixels[(24 * mask.width + 24) as usize]);
-        // A pixel inside the oversized block must have been pruned.
-        assert!(!mask.pixels[(150 * mask.width + 280) as usize]);
-    }
-
     // ---- build_pdf -----------------------------------------------------
 
     #[test]
     fn build_pdf_starts_with_percent_pdf() {
         let jpeg = make_jpeg(32, 32, false);
-        let pdf = build_pdf(&[(jpeg, 32, 32, Cs::Rgb, PdfFilter::Dct)]);
+        let pdf = build_pdf(&[(jpeg, 32, 32, Cs::Rgb, PdfFilter::Dct)], &[(32.0, 32.0)]);
         assert_eq!(&pdf[..4], b"%PDF");
     }
 
     #[test]
     fn build_pdf_dct_filter_in_stream() {
         let jpeg = make_jpeg(32, 32, false);
-        let pdf = build_pdf(&[(jpeg, 32, 32, Cs::Rgb, PdfFilter::Dct)]);
+        let pdf = build_pdf(&[(jpeg, 32, 32, Cs::Rgb, PdfFilter::Dct)], &[(32.0, 32.0)]);
         assert!(
             String::from_utf8_lossy(&pdf).contains("DCTDecode"),
             "PDF must contain DCTDecode for JPEG images"
@@ -1479,7 +1533,7 @@ mod tests {
     fn build_pdf_jpx_filter_in_stream() {
         let px = vec![128u8; 32 * 32 * 3];
         let jp2 = encode_jp2_raw(&px, 32, 32, 0.5, false).unwrap();
-        let pdf = build_pdf(&[(jp2, 32, 32, Cs::Rgb, PdfFilter::Jpx)]);
+        let pdf = build_pdf(&[(jp2, 32, 32, Cs::Rgb, PdfFilter::Jpx)], &[(32.0, 32.0)]);
         assert!(
             String::from_utf8_lossy(&pdf).contains("JPXDecode"),
             "PDF must contain JPXDecode for JP2 images"
@@ -1489,7 +1543,7 @@ mod tests {
     #[test]
     fn build_pdf_device_gray_for_gray_jpeg() {
         let jpeg = make_jpeg(32, 32, true);
-        let pdf = build_pdf(&[(jpeg, 32, 32, Cs::Gray, PdfFilter::Dct)]);
+        let pdf = build_pdf(&[(jpeg, 32, 32, Cs::Gray, PdfFilter::Dct)], &[(32.0, 32.0)]);
         assert!(String::from_utf8_lossy(&pdf).contains("DeviceGray"));
     }
 }

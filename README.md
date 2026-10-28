@@ -51,12 +51,39 @@ recommendations.
 |---|---|---|
 | `jpeg` (CLI default) | `DCTDecode` | General purpose; fastest |
 | `jp2` | `JPXDecode` | Better at low bitrates; softer artefacts |
-| `mrc` | `CCITTFaxDecode`/`JBIG2Decode` + `DCTDecode` | Scanned text: 1-bit mask for text, compressed JPEG background |
+| `mrc` | `JBIG2Decode`/`CCITTFaxDecode` + `DCTDecode` | Scanned text: 1-bit text mask (JBIG2 symbol dictionary), text colour, low-res background, pictures cut out |
 | `auto` (GUI default) | all three | Generates JPEG + JP2 + MRC variants in one run |
 
-MRC stores text as a lossless 1-bit mask (JBIG2 or CCITT G4, whichever is
-smaller) over a heavily compressed background – similar to what ABBYY
-FineReader uses internally.
+### MRC layers
+
+| Layer | Content | Resolution | Encoding |
+|---|---|---|---|
+| Text mask | text, table rules, line art | source, at most 300 dpi | JBIG2 with one symbol dictionary for the whole document, or per-page JBIG2 / CCITT G4 — whichever is smaller |
+| Text colour | one fill colour, or a colour field for multi-coloured text | scale / 4 | JPEG, q/2 (at least 25) |
+| Background | page with text and pictures removed and filled in from their surroundings | scale / 2 | JPEG, q/2 |
+| Pictures | photos and illustrations, cut out as rectangles | scale | JPEG, q |
+
+`scale` is the target resolution relative to the scan and `q` the picture
+quality; both are what the search varies. Text is binarized against the local
+paper level (a pixel is ink when it is darker than the paper by more than 42 %
+of the local paper-to-ink contrast). Tinted boxes stay in the background with
+their text in the mask. If even the smallest variant does not fit the target,
+the mask drops to half resolution (150 dpi for a 300 dpi scan).
+
+In symbol mode every glyph-sized component of the mask is matched against the
+symbols collected so far, across all pages, and the dictionary is stored once
+in the PDF (`/JBIG2Globals`). A component reuses a symbol only when the shapes
+differ by edge noise: sizes within one pixel, every differing pixel on the
+outline of both shapes, no 2×2 block of differences and few differences
+overall. Stroke-level differences are never merged, so a 6 cannot turn into an
+8; only binarization jitter along the edges is lost (1–5 % of text pixels,
+single pixels on glyph outlines), and each symbol is the per-pixel majority of
+its instances.
+Rules, frames and other large components stay in a generic region. On test
+pages the mask shrinks 3–4× compared with per-page JBIG2.
+
+Page sizes come from the scan resolution in the file (JPEG JFIF/EXIF, PNG
+pHYs, TIFF, BMP); without it the page is assumed to be A4.
 
 ---
 
@@ -134,7 +161,7 @@ Images are sorted alphabetically – that order becomes the page order in the PD
 |---|---|
 | JPEG | `variant_q{quality}_s{scale}.pdf` |
 | JPEG 2000 | `variant_jp2_b{bpp×100}_s{scale}.pdf` |
-| MRC | `variant_mrc_q{bg-quality}_s{scale}.pdf` |
+| MRC | `variant_mrc_q{picture-quality}_s{scale}.pdf` |
 
 ## License
 

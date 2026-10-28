@@ -1,3 +1,5 @@
+use super::segment::PicRect;
+
 /// Encoded image frame ready to embed in a PDF page.
 pub(crate) type Frame = (Vec<u8>, u32, u32, Cs, PdfFilter);
 
@@ -13,37 +15,74 @@ pub(crate) enum PdfFilter {
     Jpx, // JPEG2000 (JPXDecode)
 }
 
+/// 1-bit text mask, `true` = text.
 pub(crate) struct TextMask {
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) pixels: Vec<bool>,
-    pub(crate) coverage: f32,
-    /// Share of structural (line-like) components among all non-trivial ones.
-    /// High values flag tables/diagrams that MRC would misrepresent as a 1-bit mask.
-    pub(crate) line_ratio: f32,
 }
 
 /// Encoding chosen for a text mask. Picked per page as whichever produces the smaller
 /// stream — JBIG2 wins on realistic A4 masks, G4 wins on tiny/sparse ones.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MaskCodec {
     Ccitt,
     Jbig2,
 }
 
-pub(crate) struct MrcSource {
-    pub(crate) background: image::DynamicImage,
-    pub(crate) mask: TextMask,
-    pub(crate) mask_data: Vec<u8>,
-    pub(crate) mask_codec: MaskCodec,
+/// Encoded text mask at one resolution.
+#[derive(Clone)]
+pub(crate) struct MaskLayer {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) data: Vec<u8>,
+    pub(crate) codec: MaskCodec,
+    /// JBIG2 symbol dictionary shared by all pages (`/JBIG2Globals`), if symbol coded.
+    pub(crate) globals: Option<std::sync::Arc<Vec<u8>>>,
 }
 
-pub(crate) struct MrcFrame {
+/// Colour painted through the text mask.
+pub(crate) enum Foreground {
+    /// Every text pixel has (nearly) the same colour: a fill colour is enough.
+    Solid([u8; 3]),
+    /// Text colours vary: a low-resolution colour field (1/4 of the source resolution).
+    Image(image::DynamicImage),
+}
+
+/// Illustration cut out of the page, kept at source resolution.
+pub(crate) struct PictureLayer {
+    pub(crate) rect: PicRect,
+    pub(crate) image: image::DynamicImage,
+}
+
+/// Per-page MRC layers prepared once and re-encoded for every quality/scale probe.
+pub(crate) struct MrcSource {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) dpi: f32,
+    /// Text mask by level: 0 = text resolution (source, at most 300 dpi), 1 = half of it
+    /// (used when the target size is too small). Empty: no text.
+    pub(crate) masks: Vec<MaskLayer>,
+    pub(crate) foreground: Foreground,
+    /// Background with text and pictures filled in, at half the source resolution.
+    pub(crate) background: image::DynamicImage,
+    pub(crate) pictures: Vec<PictureLayer>,
+}
+
+pub(crate) enum FgFrame {
+    Solid([u8; 3]),
+    Image(Frame),
+}
+
+pub(crate) struct MrcFrame<'a> {
+    /// Page size in points.
+    pub(crate) page_size: (f32, f32),
+    /// Source image size in pixels (maps picture rectangles onto the page).
+    pub(crate) source_size: (u32, u32),
     pub(crate) background: Frame,
-    pub(crate) mask_data: Vec<u8>,
-    pub(crate) mask_codec: MaskCodec,
-    pub(crate) mask_w: u32,
-    pub(crate) mask_h: u32,
+    pub(crate) mask: Option<&'a MaskLayer>,
+    pub(crate) foreground: FgFrame,
+    pub(crate) pictures: Vec<(PicRect, Frame)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

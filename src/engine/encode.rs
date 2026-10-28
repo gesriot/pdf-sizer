@@ -64,7 +64,45 @@ pub(crate) fn encode_text_mask_jbig2(
     if result.global_data.is_some() {
         return Err("JBIG2: lossless path unexpectedly produced a global dictionary".into());
     }
-    Ok(result.page_data)
+    Ok(strip_jbig2_end_segments(result.page_data))
+}
+
+/// Drop end-of-page (49) and end-of-file (51) segments: PDF does not use them in embedded
+/// JBIG2 streams and Poppler reports them as "Unknown segment type". Returns the data
+/// unchanged if it cannot be walked segment by segment.
+pub(crate) fn strip_jbig2_end_segments(data: Vec<u8>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut p = 0;
+    while p < data.len() {
+        let Some(header) = data.get(p..p + 6) else {
+            return data;
+        };
+        let number = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+        let flags = header[4];
+        let referred = header[5] >> 5;
+        if referred == 7 {
+            return data;
+        }
+        let number_size = if number <= 256 { 1 } else if number <= 65536 { 2 } else { 4 };
+        let page_size = if flags & 0x40 != 0 { 4 } else { 1 };
+        let len_at = p + 6 + referred as usize * number_size + page_size;
+        let Some(len) = data.get(len_at..len_at + 4) else {
+            return data;
+        };
+        let len = u32::from_be_bytes([len[0], len[1], len[2], len[3]]);
+        if len == u32::MAX {
+            return data;
+        }
+        let end = len_at + 4 + len as usize;
+        if end > data.len() {
+            return data;
+        }
+        if !matches!(flags & 0x3F, 49 | 51) {
+            out.extend_from_slice(&data[p..end]);
+        }
+        p = end;
+    }
+    out
 }
 
 pub(crate) fn estimate_pdf_size(
