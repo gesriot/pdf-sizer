@@ -15,7 +15,10 @@ use crate::progress::{
 };
 
 pub(crate) fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
-    let native_options = eframe::NativeOptions::default();
+    let native_options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default().with_icon(app_icon()),
+        ..Default::default()
+    };
     eframe::run_native(
         "pdf-sizer",
         native_options,
@@ -25,6 +28,12 @@ pub(crate) fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
         }),
     )?;
     Ok(())
+}
+
+/// Dock and window icon. `scripts/package-macos.sh` writes this from `assets/icon.png`.
+fn app_icon() -> egui::IconData {
+    eframe::icon_data::from_png_bytes(include_bytes!("../macos/icon-runtime.png"))
+        .expect("bundled app icon must be a valid PNG")
 }
 
 #[derive(Clone, Debug)]
