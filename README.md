@@ -12,7 +12,7 @@ optional scan preprocessing (despeckle, background flattening, deskew).
 ## Quick start
 
 ```bash
-# GUI (default when launched without arguments)
+# GUI
 pdf-sizer
 
 # CLI
@@ -145,6 +145,52 @@ cargo build --release
 
 Binary: `target/release/pdf-sizer`
 
+### macOS packaging
+
+To build the macOS app bundle, ZIP archive, and DMG, run the packaging
+script on macOS. It requires the build tools listed above, Python 3 with
+Pillow, and the macOS utilities `plutil`, `zip`, and `hdiutil`:
+
+```bash
+./scripts/package-macos.sh
+```
+
+The script generates transparent rounded icons from `assets/icon.png`,
+including the GUI runtime PNG and the bundle's `.icns` icon, then runs
+`cargo build --release` and creates:
+
+- `dist/pdf-sizer.app`
+- `dist/pdf-sizer.app.zip`
+- `dist/pdf-sizer.dmg`
+
+The DMG includes an Applications shortcut for installation and is verified
+with `hdiutil`. To package an existing release binary without rebuilding:
+
+```bash
+./scripts/package-macos.sh --skip-build
+```
+
+### Windows packaging
+
+To embed the app icon in the Windows executable and create a portable ZIP,
+run the packaging script from PowerShell. It requires Python with Pillow
+and `rc.exe` from the Windows SDK:
+
+```powershell
+.\scripts\package-windows.ps1
+```
+
+The script converts the existing `macos/icon-runtime.png` artwork to a
+multi-size Windows icon (16-256 px), embeds it in the release executable,
+and creates:
+
+- `dist/windows/pdf-sizer.exe`
+- `dist/windows/pdf-sizer.ico` (also usable for shortcuts)
+- `dist/pdf-sizer-windows.zip`
+
+The embedded icon is used by Windows Explorer, shortcuts, and the taskbar.
+The GUI continues to use the same artwork for its window icon.
+
 ---
 
 ## Supported image formats
@@ -166,4 +212,3 @@ Images are sorted alphabetically – that order becomes the page order in the PD
 ## License
 
 MIT – see [LICENSE](LICENSE).
-
